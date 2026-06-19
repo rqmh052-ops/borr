@@ -4,6 +4,7 @@ import sqlite3
 import datetime
 import time
 import os
+import hashlib
 
 # ======================= الثوابت =======================
 BOT_TOKEN = "8737177889:AAGnnxZq9Yyptc1cdLTpEv5FoNbT5Jn8SQY"
@@ -19,54 +20,44 @@ user_states = {}
 def init_db():
     conn = sqlite3.connect('bot_data.db', check_same_thread=False)
     c = conn.cursor()
-    
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         tg_id INTEGER PRIMARY KEY, username TEXT, balance REAL DEFAULT 0,
         is_vip INTEGER DEFAULT 0, vip_activated_date TEXT, referrer_id INTEGER,
         join_date TEXT
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS referrals (
         id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referred_id INTEGER,
         status TEXT, created_at TEXT, completed_at TEXT, channel_checked_date TEXT
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS banned_pairs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user1_id INTEGER, user2_id INTEGER
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, admin_id INTEGER,
         created_at TEXT
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS apps (
         id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, name TEXT,
         description TEXT, file_id TEXT, admin_id INTEGER, added_date TEXT,
         download_count INTEGER DEFAULT 0
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS vip_apps (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, description TEXT,
         file_id TEXT, admin_id INTEGER, added_date TEXT,
         download_count INTEGER DEFAULT 0
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS user_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, type TEXT,
         app_name TEXT, description TEXT, file_id TEXT, status TEXT,
         admin_feedback TEXT, created_at TEXT
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY, value TEXT
     )''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS admin_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, action TEXT,
         details TEXT, created_at TEXT
     )''')
-    
     default_settings = {
         'referrals_for_feature': '2',
         'referrals_for_vip': '10',
@@ -76,7 +67,6 @@ def init_db():
     }
     for key, val in default_settings.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
-    
     conn.commit()
     conn.close()
 
@@ -123,11 +113,15 @@ def register_user(tg_id, username, referrer_id=None):
     conn = db_conn()
     c = conn.cursor()
     if not get_user(tg_id):
-        c.execute("INSERT INTO users (tg_id, username, referrer_id, join_date) VALUES (?, ?, ?, ?)",
-                  (tg_id, username, referrer_id, datetime.datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-        return True
+        try:
+            c.execute("INSERT INTO users (tg_id, username, referrer_id, join_date) VALUES (?, ?, ?, ?)",
+                      (tg_id, username, referrer_id, datetime.datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.IntegrityError:
+            conn.close()
+            return False
     conn.close()
     return False
 
@@ -163,7 +157,7 @@ def check_subscription(tg_id):
     try:
         member = bot.get_chat_member(CHANNEL_ID, tg_id)
         return member.status in ['member', 'administrator', 'creator']
-    except:
+    except Exception:
         return False
 
 def process_pending_referrals():
@@ -183,7 +177,7 @@ def process_pending_referrals():
             last_check = c.execute("SELECT channel_checked_date FROM referrals WHERE id=?", (ref_id,)).fetchone()
             if last_check and last_check[0]:
                 last_time = datetime.datetime.fromisoformat(last_check[0])
-                if (now - last_time).seconds > grace_hours * 3600:
+                if (now - last_time).total_seconds() > grace_hours * 3600:
                     c.execute("UPDATE referrals SET status='cancelled' WHERE id=?", (ref_id,))
                     conn.commit()
                     continue
@@ -281,6 +275,14 @@ def search_apps(query, page=1, per_page=10):
     total = c.fetchone()[0]
     conn.close()
     return apps, total
+
+def get_app_by_id(app_id):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, name, description, file_id, download_count, category_id FROM apps WHERE id=?", (app_id,))
+    app = c.fetchone()
+    conn.close()
+    return app
 
 # ======================= واجهات الأزرار =======================
 def main_menu_keyboard(tg_id):
@@ -384,7 +386,7 @@ def callback_handler(call):
             conn.commit()
             conn.close()
             log_admin_action(tg_id, "delete_category", f"حذف تصنيف: {cat_name}")
-            bot.answer_callback_query(call.id, f"✅ تم حذف التصنيف {cat_name} وجميع تطبيقاته.")
+            bot.answer_callback_query(call.id, f"✅ تم حذف التصنيف {cat_name}")
             categories = get_categories()
             keyboard = InlineKeyboardMarkup(row_width=1)
             for cid, name in categories:
@@ -413,6 +415,7 @@ def callback_handler(call):
             if nav_buttons:
                 keyboard.add(*nav_buttons)
             for app_id, name, desc, file_id, downloads in apps:
+                # اختصار callback_data: استخدام app_+id فقط
                 keyboard.add(InlineKeyboardButton(f"📱 {name} ({downloads}⬇️)", callback_data=f"app_{app_id}"))
             if not apps:
                 keyboard.add(InlineKeyboardButton("📭 لا توجد تطبيقات", callback_data="dummy"))
@@ -460,7 +463,6 @@ def callback_handler(call):
                 log_admin_action(tg_id, "delete_app", f"حذف تطبيق: {app_name}")
                 bot.answer_callback_query(call.id, f"✅ تم حذف {app_name}")
             conn.close()
-            # العودة إلى قائمة التطبيقات
             apps, total = get_apps_by_category(cat_id)
             keyboard = InlineKeyboardMarkup(row_width=2)
             for aid, name, desc, file_id, downloads in apps:
@@ -474,39 +476,43 @@ def callback_handler(call):
             cat_name = get_category_name(cat_id) or "تصنيف"
             bot.edit_message_text(f"📂 {cat_name}", chat_id, message_id, reply_markup=keyboard)
         
-        # ========== عرض التطبيق ==========
+        # ========== عرض التطبيق (التحميل) ==========
         elif data.startswith("app_"):
             app_id = int(data.split("_")[1])
-            conn = db_conn()
-            c = conn.cursor()
-            c.execute("SELECT name, description, file_id, download_count, category_id FROM apps WHERE id=?", (app_id,))
-            app = c.fetchone()
+            app = get_app_by_id(app_id)
             if app:
-                name, desc, file_id, downloads, cat_id = app
+                app_id, name, desc, file_id, downloads, cat_id = app
                 # تحديث عدد التحميلات
+                conn = db_conn()
+                c = conn.cursor()
                 c.execute("UPDATE apps SET download_count = download_count + 1 WHERE id=?", (app_id,))
                 conn.commit()
+                conn.close()
                 keyboard = InlineKeyboardMarkup()
-                keyboard.add(InlineKeyboardButton("📥 تحميل", callback_data=f"download_app_{file_id}_{name}"))
+                # زر التحميل: نمرر app_id فقط، ثم نستخرج file_id من قاعدة البيانات
+                keyboard.add(InlineKeyboardButton("📥 تحميل", callback_data=f"download_{app_id}"))
                 if is_admin(tg_id):
-                    keyboard.add(InlineKeyboardButton("✏️ تعديل", callback_data=f"edit_app_{app_id}"))
+                    keyboard.add(InlineKeyboardButton("✏️ تعديل الاسم", callback_data=f"edit_app_{app_id}"))
                 keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data=f"cat_{cat_id}"))
                 bot.edit_message_text(f"📱 *{name}*\n⬇️ {downloads+1} تحميل\n\n{desc}", 
                                       chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard)
             else:
                 bot.answer_callback_query(call.id, "التطبيق غير موجود")
-            conn.close()
         
-        elif data.startswith("download_app_"):
-            parts = data.split("_")
-            file_id = parts[2]
-            name = "_".join(parts[3:])
-            try:
-                bot.send_document(tg_id, file_id, caption=f"📱 {name}")
-                bot.answer_callback_query(call.id, "✅ تم الإرسال")
-            except Exception as e:
-                bot.answer_callback_query(call.id, "❌ خطأ", show_alert=True)
-                bot.send_message(ADMIN_ID, f"خطأ: {e}")
+        # ========== زر التحميل (يستخدم app_id للوصول إلى file_id) ==========
+        elif data.startswith("download_") and not data.startswith("download_vip_"):
+            app_id = int(data.split("_")[1])
+            app = get_app_by_id(app_id)
+            if app:
+                app_id, name, desc, file_id, downloads, cat_id = app
+                try:
+                    bot.send_document(tg_id, file_id, caption=f"📱 {name}")
+                    bot.answer_callback_query(call.id, "✅ تم الإرسال")
+                except Exception as e:
+                    bot.answer_callback_query(call.id, "❌ خطأ في التحميل", show_alert=True)
+                    bot.send_message(ADMIN_ID, f"خطأ: {e}")
+            else:
+                bot.answer_callback_query(call.id, "❌ التطبيق غير موجود")
         
         elif data.startswith("edit_app_"):
             if not is_admin(tg_id):
@@ -516,7 +522,7 @@ def callback_handler(call):
             bot.edit_message_text("✏️ أرسل الاسم الجديد للتطبيق:", chat_id, message_id)
         
         # ========== VIP ==========
-        elif data == "show_vip":
+        elif data == "show_vip" or data.startswith("show_vip_page_"):
             user = get_user(tg_id)
             if not user or not user[3]:
                 keyboard = InlineKeyboardMarkup()
@@ -568,22 +574,31 @@ def callback_handler(call):
                 name, desc, file_id, downloads = app
                 c.execute("UPDATE vip_apps SET download_count = download_count + 1 WHERE id=?", (app_id,))
                 conn.commit()
+                conn.close()
                 keyboard = InlineKeyboardMarkup()
-                keyboard.add(InlineKeyboardButton("📥 تحميل VIP", callback_data=f"download_vip_{file_id}_{name}"))
+                keyboard.add(InlineKeyboardButton("📥 تحميل VIP", callback_data=f"download_vip_{app_id}"))
                 keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="show_vip"))
                 bot.edit_message_text(f"👑 *{name}*\n⬇️ {downloads+1}\n\n{desc}", chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard)
-            conn.close()
+            else:
+                conn.close()
         
         elif data.startswith("download_vip_"):
-            parts = data.split("_")
-            file_id = parts[2]
-            name = "_".join(parts[3:])
-            try:
-                bot.send_document(tg_id, file_id, caption=f"👑 VIP: {name}")
-                bot.answer_callback_query(call.id, "✅ تم الإرسال")
-            except Exception as e:
-                bot.answer_callback_query(call.id, "❌ خطأ", show_alert=True)
-                bot.send_message(ADMIN_ID, f"خطأ VIP: {e}")
+            app_id = int(data.split("_")[2])
+            conn = db_conn()
+            c = conn.cursor()
+            c.execute("SELECT name, file_id FROM vip_apps WHERE id=?", (app_id,))
+            app = c.fetchone()
+            conn.close()
+            if app:
+                name, file_id = app
+                try:
+                    bot.send_document(tg_id, file_id, caption=f"👑 VIP: {name}")
+                    bot.answer_callback_query(call.id, "✅ تم الإرسال")
+                except Exception as e:
+                    bot.answer_callback_query(call.id, "❌ خطأ", show_alert=True)
+                    bot.send_message(ADMIN_ID, f"خطأ VIP: {e}")
+            else:
+                bot.answer_callback_query(call.id, "❌ غير موجود")
         
         elif data == "add_vip_app":
             if not is_admin(tg_id):
@@ -796,11 +811,11 @@ def callback_handler(call):
             if not is_admin(tg_id):
                 return
             try:
-                # إنشاء نسخة احتياطية
                 backup_name = f"backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
                 import shutil
                 shutil.copy2('bot_data.db', backup_name)
-                bot.send_document(tg_id, open(backup_name, 'rb'), caption=f"💾 نسخة احتياطية {backup_name}")
+                with open(backup_name, 'rb') as backup_file:
+                    bot.send_document(tg_id, backup_file, caption=f"💾 نسخة احتياطية {backup_name}")
                 os.remove(backup_name)
                 log_admin_action(tg_id, "backup_db", "تم إنشاء نسخة احتياطية")
                 bot.answer_callback_query(call.id, "✅ تم إنشاء النسخة الاحتياطية وإرسالها.")
@@ -820,15 +835,15 @@ def callback_handler(call):
             keyboard = InlineKeyboardMarkup(row_width=1)
             for label, key in settings.items():
                 val = get_setting(key)
-                keyboard.add(InlineKeyboardButton(f"{label}: {val}", callback_data=f"edit_setting_{key}"))
+                keyboard.add(InlineKeyboardButton(f"{label}: {val}", callback_data=f"edit_setting|{key}"))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
             bot.edit_message_text("📊 *الإعدادات*", chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard)
         
-        elif data.startswith("edit_setting_"):
+        elif data.startswith("edit_setting|"):
             if not is_admin(tg_id):
                 return
-            key = data.split("_")[2]
-            user_states[tg_id] = f"edit_setting_{key}"
+            key = data.split("|", 1)[1]
+            user_states[tg_id] = f"edit_setting|{key}"
             bot.edit_message_text(f"✏️ أرسل القيمة الجديدة لـ {key}:", chat_id, message_id)
         
         # ========== طلبات الموافقة ==========
@@ -1001,7 +1016,7 @@ def handle_document(message):
         cat_id = int(state.split("_")[3])
         file_id = message.document.file_id
         file_name = message.document.file_name or "تطبيق"
-        user_states[tg_id] = f"waiting_app_desc_{cat_id}_{file_id}_{file_name}"
+        user_states[tg_id] = f"waiting_app_desc|{cat_id}|{file_id}|{file_name}"
         bot.reply_to(message, "✏️ أرسل الوصف:")
         return
     
@@ -1015,7 +1030,7 @@ def handle_document(message):
         update_balance(tg_id, -required)
         file_id = message.document.file_id
         file_name = message.document.file_name or "تطبيق"
-        user_states[tg_id] = f"waiting_upload_desc_{file_id}_{file_name}"
+        user_states[tg_id] = f"waiting_upload_desc|{file_id}|{file_name}"
         bot.reply_to(message, "✏️ أرسل الوصف:")
         return
     
@@ -1024,7 +1039,7 @@ def handle_document(message):
             return
         file_id = message.document.file_id
         file_name = message.document.file_name or "VIP"
-        user_states[tg_id] = f"waiting_vip_desc_{file_id}_{file_name}"
+        user_states[tg_id] = f"waiting_vip_desc|{file_id}|{file_name}"
         bot.reply_to(message, "✏️ أرسل وصف VIP:")
         return
 
@@ -1047,14 +1062,14 @@ def receive_search_query(message):
     bot.reply_to(message, f"🔍 نتائج البحث عن '{query}' ({len(apps)}):", reply_markup=keyboard)
     user_states.pop(tg_id, None)
 
-@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("waiting_app_desc_"))
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("waiting_app_desc|"))
 def receive_app_desc(message):
     tg_id = message.from_user.id
     state = user_states[tg_id]
-    parts = state.split("_")
-    cat_id = int(parts[3])
-    file_id = parts[4]
-    file_name = "_".join(parts[5:])
+    parts = state.split("|", 3)
+    cat_id = int(parts[1])
+    file_id = parts[2]
+    file_name = parts[3]
     description = message.text.strip()
     if not description:
         bot.reply_to(message, "الوصف لا يمكن أن يكون فارغاً.")
@@ -1073,13 +1088,13 @@ def receive_app_desc(message):
     except Exception as e:
         bot.reply_to(message, f"❌ خطأ: {e}")
 
-@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("waiting_upload_desc_"))
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("waiting_upload_desc|"))
 def receive_upload_desc(message):
     tg_id = message.from_user.id
     state = user_states[tg_id]
-    parts = state.split("_")
-    file_id = parts[3]
-    file_name = "_".join(parts[4:])
+    parts = state.split("|", 2)
+    file_id = parts[1]
+    file_name = parts[2]
     description = message.text
     conn = db_conn()
     c = conn.cursor()
@@ -1092,13 +1107,13 @@ def receive_upload_desc(message):
     if is_admin(ADMIN_ID):
         bot.send_message(ADMIN_ID, f"📩 طلب رفع جديد من @{message.from_user.username}\nالتطبيق: {file_name}")
 
-@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("waiting_vip_desc_"))
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("waiting_vip_desc|"))
 def receive_vip_desc(message):
     tg_id = message.from_user.id
     state = user_states[tg_id]
-    parts = state.split("_")
-    file_id = parts[3]
-    file_name = "_".join(parts[4:])
+    parts = state.split("|", 2)
+    file_id = parts[1]
+    file_name = parts[2]
     desc = message.text
     try:
         conn = db_conn()
@@ -1135,12 +1150,12 @@ def receive_crack_request(message):
     if is_admin(ADMIN_ID):
         bot.send_message(ADMIN_ID, f"📩 طلب كسر جديد من @{message.from_user.username}\nالتطبيق: {message.text}")
 
-@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("edit_setting_"))
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id, "").startswith("edit_setting|"))
 def edit_setting_value(message):
     tg_id = message.from_user.id
     if not is_admin(tg_id):
         return
-    key = user_states[tg_id].split("_")[2]
+    key = user_states[tg_id].split("|", 1)[1]
     value = message.text.strip()
     try:
         float(value)
@@ -1180,7 +1195,8 @@ if __name__ == "__main__":
 
     while True:
         try:
-            bot.polling(non_stop=True, timeout=30, long_polling_timeout=20, skip_pending=True)
+            # استخدام polling مع إعدادات مهلة منخفضة
+            bot.polling(non_stop=True, timeout=20, long_polling_timeout=15, skip_pending=True)
         except Exception as e:
             print(f"⚠️ خطأ: {e}. إعادة المحاولة بعد 10 ثوان...")
             time.sleep(10)
