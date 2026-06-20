@@ -339,6 +339,17 @@ def log_admin_action(admin_id, action, details=""):
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
+def escape_markdown(text: str) -> str:
+    """
+    يهرّب الرموز الخاصة بصيغة Markdown القديمة (legacy) التي يستخدمها البوت،
+    لمنع كسر التنسيق عند استخدام اسم المستخدم (الذي قد يحتوي رموزاً) داخل نص منسّق.
+    """
+    if not text:
+        return text
+    for ch in ['_', '*', '`', '[']:
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
 def restore_database_from_file(uploaded_db_path: str):
     """
     يستبدل قاعدة البيانات الحالية بالكامل بملف .db مرفوع من الإدمن.
@@ -568,6 +579,18 @@ def delete_app_by_code(app_code: str):
     conn.commit()
     conn.close()
 
+def rename_app_by_code(app_code: str, new_name: str):
+    """
+    يعدّل الاسم الظاهر فقط (عمود name في app_codes) المستخدم في نتائج البحث
+    والقوائم. لا يلمس أبداً اسم الملف الأصلي (file_name) ولا الرسالة المخزنة
+    في قناة DB ولا الكود الداخلي (app_code) ولا channel_msg_id.
+    """
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("UPDATE app_codes SET name=? WHERE app_code=?", (new_name, app_code))
+    conn.commit()
+    conn.close()
+
 def search_apps(query: str, page: int = 1, per_page: int = 10):
     conn = db_conn()
     c = conn.cursor()
@@ -659,9 +682,9 @@ def callback_handler(call):
         # التحقق من الاشتراك
         if data not in ['check_subscription', 'dummy']:
             if not check_subscription(tg_id):
-                keyboard = InlineKeyboardMarkup()
-                keyboard.add(InlineKeyboardButton("📢 اشترك في القناة", url=FORCE_SUB_CHANNEL_URL))
-                keyboard.add(InlineKeyboardButton("🔄 تأكد", callback_data="check_subscription"))
+                keyboard = InlineKeyboardMarkup(row_width=1)
+                keyboard.add(InlineKeyboardButton("📢   اشترك في القناة   📢", url=FORCE_SUB_CHANNEL_URL))
+                keyboard.add(InlineKeyboardButton("🔄   تأكد الاشتراك   🔄", callback_data="check_subscription"))
                 bot.edit_message_text("⚠️ يجب الاشتراك في القناة:", chat_id, message_id, reply_markup=keyboard)
                 return
 
@@ -787,13 +810,16 @@ def callback_handler(call):
             token = generate_user_token(tg_id, app_code)
             safe_token = token.replace(":", "_")  # نجعله آمناً للـ callback_data
 
-            keyboard = InlineKeyboardMarkup()
+            keyboard = InlineKeyboardMarkup(row_width=2)
             keyboard.add(InlineKeyboardButton(
                 "📥 تحميل",
                 callback_data=f"dl_{safe_token}"
             ))
             if is_admin(tg_id):
-                keyboard.add(InlineKeyboardButton("🗑️ حذف", callback_data=f"delapp_{app_code}"))
+                keyboard.add(
+                    InlineKeyboardButton("✏️ تعديل الاسم", callback_data=f"renameapp_{app_code}"),
+                    InlineKeyboardButton("🗑️ حذف", callback_data=f"delapp_{app_code}")
+                )
 
             # رجوع لتصنيف التطبيق
             categories = get_categories()
@@ -826,6 +852,26 @@ def callback_handler(call):
                 bot.answer_callback_query(call.id, "✅ تم الإرسال!")
             else:
                 bot.answer_callback_query(call.id, "❌ خطأ في الإرسال، تم إبلاغ الإدمن.", show_alert=True)
+
+        # ========== تعديل اسم تطبيق (الاسم الظاهر فقط، اسم الملف يبقى كما هو) ==========
+        elif data.startswith("renameapp_"):
+            if not is_admin(tg_id):
+                return
+            app_code = data[len("renameapp_"):]
+            info = get_app_info(app_code)
+            if not info:
+                bot.answer_callback_query(call.id, "التطبيق غير موجود.")
+                return
+            current_name = info[4]
+            user_states[tg_id] = f"waiting_rename_app|{app_code}"
+            keyboard = InlineKeyboardMarkup()
+            keyboard.add(InlineKeyboardButton("❌ إلغاء", callback_data=f"appv_{app_code}"))
+            bot.edit_message_text(
+                f"✏️ الاسم الحالي: *{current_name}*\n\n"
+                f"أرسل الاسم الجديد الذي سيظهر في نتائج البحث والقائمة فقط\n"
+                f"(اسم الملف الأصلي لن يتغيّر):",
+                chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
+            )
 
         # ========== حذف تطبيق ==========
         elif data.startswith("delapp_"):
@@ -1285,13 +1331,20 @@ def start_command(message):
         return
 
     if not check_subscription(tg_id):
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("📢 اشترك في القناة", url=FORCE_SUB_CHANNEL_URL))
-        keyboard.add(InlineKeyboardButton("🔄 تأكد", callback_data="check_subscription"))
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(InlineKeyboardButton("📢   اشترك في القناة   📢", url=FORCE_SUB_CHANNEL_URL))
+        keyboard.add(InlineKeyboardButton("🔄   تأكد الاشتراك   🔄", callback_data="check_subscription"))
         bot.send_message(tg_id, "⚠️ يجب الاشتراك في القناة:", reply_markup=keyboard)
         return
 
-    bot.send_message(tg_id, "مرحباً بك 🚀", reply_markup=main_menu_keyboard(tg_id))
+    display_name = escape_markdown(message.from_user.first_name or username)
+    name_link = f"[{display_name}](tg://user?id={tg_id})"
+    bot.send_message(
+        tg_id,
+        f"مرحباً بك {name_link} 🚀",
+        parse_mode='Markdown',
+        reply_markup=main_menu_keyboard(tg_id)
+    )
 
 # ========== استقبال ملف قاعدة البيانات (.db) المرفوع من الإدمن لاستعادتها ==========
 @bot.message_handler(content_types=['document'],
@@ -1477,6 +1530,41 @@ def receive_category_name(message):
         bot.send_message(message.chat.id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(message.from_user.id))
     except sqlite3.IntegrityError:
         bot.reply_to(message, "❌ هذا التصنيف موجود مسبقاً.")
+
+# ========== استقبال الاسم الجديد للتطبيق (الاسم الظاهر فقط) ==========
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id)
+                     and isinstance(user_states.get(m.from_user.id, ""), str)
+                     and user_states.get(m.from_user.id, "").startswith("waiting_rename_app|"))
+def receive_app_new_name(message):
+    tg_id = message.from_user.id
+    state = user_states[tg_id]
+    app_code = state.split("|", 1)[1]
+
+    new_name = message.text.strip() if message.text else ""
+    if not new_name:
+        bot.reply_to(message, "❌ الاسم غير صالح، أرسل اسماً نصياً.")
+        return
+
+    info = get_app_info(app_code)
+    if not info:
+        bot.reply_to(message, "❌ التطبيق لم يعد موجوداً.")
+        user_states.pop(tg_id, None)
+        return
+
+    old_name = info[4]
+    rename_app_by_code(app_code, new_name)
+    log_admin_action(tg_id, "rename_app", f"app_code={app_code}, old='{old_name}', new='{new_name}'")
+    user_states.pop(tg_id, None)
+
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 رجوع للتطبيق", callback_data=f"appv_{app_code}"))
+    bot.reply_to(message,
+        f"✅ تم تعديل الاسم الظاهر بنجاح:\n"
+        f"من: *{old_name}*\n"
+        f"إلى: *{new_name}*\n\n"
+        f"ملاحظة: اسم الملف الأصلي لم يتغيّر.",
+        parse_mode='Markdown', reply_markup=keyboard
+    )
 
 # ========== البحث ==========
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_search_query")
