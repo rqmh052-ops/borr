@@ -22,6 +22,7 @@ DB_CHANNEL_ID = -1004325834135           # ← غيّر هذا لـ ID قناة 
 bot = telebot.TeleBot(BOT_TOKEN)
 user_states = {}
 pending_app_messages = {}   # يخزن مؤقتاً رسالة الملف الأصلية من الإدمن
+pending_db_restores = {}    # يخزن مؤقتاً مسار ملف .db المرفوع بانتظار تأكيد الاستبدال
 
 # مفتاح سري للتشفير الداخلي - لا يُشارك أبداً
 SECRET_KEY = secrets.token_hex(32)
@@ -198,35 +199,118 @@ def init_db():
 
 init_db()
 
-# ======================= نسخ احتياطي تلقائي =======================
-def auto_backup():
-    """نسخة احتياطية كل 6 ساعات"""
-    while True:
-        time.sleep(6 * 3600)
-        try:
-            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            backup_path = os.path.join(BACKUP_DIR, f"backup_{ts}.db")
-            # نسخ آمن باستخدام SQLite backup API
-            src = sqlite3.connect(DB_PATH)
-            dst = sqlite3.connect(backup_path)
-            src.backup(dst)
-            dst.close()
-            src.close()
-            # إرسال للإدمن
-            with open(backup_path, 'rb') as f:
-                bot.send_document(ADMIN_ID, f, caption=f"💾 نسخة احتياطية تلقائية\n🕐 {ts}")
-            # احتفظ بآخر 10 نسخ فقط
-            backups = sorted([
-                os.path.join(BACKUP_DIR, f)
-                for f in os.listdir(BACKUP_DIR)
-                if f.endswith('.db')
-            ])
-            for old in backups[:-10]:
-                os.remove(old)
-        except Exception as e:
-            print(f"⚠️ خطأ في النسخ الاحتياطي: {e}")
+# ======================= نسخ احتياطي تلقائي لقاعدة البيانات الكاملة (قناة DB) =======================
+# ⚠️ خط أحمر: هذا النظام يتعامل فقط مع رسالة النسخة الاحتياطية المحفوظ message_id
+# الخاص بها في settings تحت المفتاح BACKUP_MSG_ID_KEY. لا يلمس أبداً أي رسالة
+# أخرى في القناة (رسائل التطبيقات المخزنة في app_codes.channel_msg_id).
+BACKUP_MSG_ID_KEY = "db_backup_message_id"
+BACKUP_VERSION_KEY = "db_backup_version"
+BACKUP_INTERVAL_SECONDS = 30 * 60  # 30 دقيقة
 
-threading.Thread(target=auto_backup, daemon=True).start()
+def _make_backup_snapshot() -> str:
+    """
+    ينشئ نسخة لقطة (snapshot) آمنة من قاعدة البيانات الكاملة باستخدام SQLite backup API
+    (لا يقرأ الملف مباشرة لتفادي مشاكل WAL/التزامن)، ويعيد مسار الملف المؤقت.
+    """
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    snapshot_path = os.path.join(BACKUP_DIR, f"snapshot_{ts}.db")
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(snapshot_path)
+    src.backup(dst)
+    dst.close()
+    src.close()
+    return snapshot_path
+
+def _get_backup_state():
+    """يقرأ message_id ورقم النسخة الحاليين لرسالة النسخة الاحتياطية من settings."""
+    msg_id_raw = get_setting(BACKUP_MSG_ID_KEY)
+    version_raw = get_setting(BACKUP_VERSION_KEY)
+    msg_id = int(msg_id_raw) if msg_id_raw else None
+    version = int(version_raw) if version_raw else 0
+    return msg_id, version
+
+def _save_backup_state(msg_id: int, version: int):
+    """يحفظ message_id ورقم النسخة الجديدين في settings (نفس القاعدة، مفتاح مخصص)."""
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (BACKUP_MSG_ID_KEY, str(msg_id)))
+    c.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (BACKUP_VERSION_KEY, str(version)))
+    conn.commit()
+    conn.close()
+
+def send_or_update_db_backup():
+    """
+    يرسل/يحدّث رسالة النسخة الاحتياطية الكاملة لقاعدة البيانات في DB_CHANNEL_ID.
+    - أول مرة: يرسل رسالة جديدة ويحفظ message_id الناتج.
+    - المرات التالية: يحاول تعديل نفس الرسالة (editMessageMedia) برقم نسخة +1.
+      لو فشل التعديل (مثلاً الرسالة حُذفت من القناة)، يحذف القديمة إن وُجدت،
+      يرسل رسالة جديدة، ويثبّتها (Pin)، ويحفظ message_id الجديد.
+    ⚠️ هذه الدالة لا تتعامل أبداً مع channel_msg_id الخاصة بالتطبيقات.
+    """
+    snapshot_path = None
+    try:
+        snapshot_path = _make_backup_snapshot()
+        old_msg_id, old_version = _get_backup_state()
+        new_version = old_version + 1
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        caption = (
+            f"🗄️ *قاعدة البيانات الكاملة - نسخة احتياطية*\n"
+            f"📦 النسخة (Version): #{new_version}\n"
+            f"🕐 آخر تحديث: {ts}"
+        )
+
+        if old_msg_id:
+            # نحاول التعديل على نفس الرسالة أولاً (الحل المفضل)
+            try:
+                with open(snapshot_path, 'rb') as f:
+                    bot.edit_message_media(
+                        chat_id=DB_CHANNEL_ID,
+                        message_id=old_msg_id,
+                        media=telebot.types.InputMediaDocument(
+                            f,
+                            caption=caption,
+                            parse_mode='Markdown'
+                        )
+                    )
+                _save_backup_state(old_msg_id, new_version)
+                return
+            except Exception as edit_err:
+                print(f"⚠️ فشل تعديل رسالة النسخة الاحتياطية (msg_id={old_msg_id}): {edit_err}")
+                # خط أحمر: نحذف فقط old_msg_id المحفوظ لدينا كرسالة نسخة احتياطية،
+                # ولا نلمس أي رسالة تطبيقات أبداً.
+                try:
+                    bot.delete_message(DB_CHANNEL_ID, old_msg_id)
+                except Exception as del_err:
+                    print(f"⚠️ تعذّر حذف رسالة النسخة الاحتياطية القديمة: {del_err}")
+
+        # إرسال رسالة جديدة (أول مرة، أو fallback بعد فشل التعديل)
+        with open(snapshot_path, 'rb') as f:
+            sent = bot.send_document(DB_CHANNEL_ID, f, caption=caption, parse_mode='Markdown')
+        _save_backup_state(sent.message_id, new_version)
+        # التثبيت مؤجّل حالياً بناءً على طلب صريح (الحد المجاني للتثبيت سينتهي قريباً)
+        # عند تفعيله لاحقاً: bot.pin_chat_message(DB_CHANNEL_ID, sent.message_id, disable_notification=True)
+
+    except Exception as e:
+        print(f"⚠️ خطأ في النسخ الاحتياطي التلقائي للقناة: {e}")
+    finally:
+        if snapshot_path and os.path.exists(snapshot_path):
+            try:
+                os.remove(snapshot_path)
+            except Exception:
+                pass
+
+def auto_backup():
+    """يشغّل نسخة احتياطية كاملة كل 30 دقيقة تلقائياً بمجرد تشغيل البوت."""
+    while True:
+        try:
+            send_or_update_db_backup()
+        except Exception as e:
+            print(f"⚠️ خطأ غير متوقع في auto_backup: {e}")
+        time.sleep(BACKUP_INTERVAL_SECONDS)
+# ملاحظة: يتم تشغيل هذا الـ Thread بعد تعريف get_setting/set_setting (انظر أسفل قسم الدوال المساعدة)
 
 # ======================= دوال مساعدة =======================
 def get_setting(key):
@@ -254,6 +338,46 @@ def log_admin_action(admin_id, action, details=""):
 
 def is_admin(user_id):
     return user_id == ADMIN_ID
+
+def restore_database_from_file(uploaded_db_path: str):
+    """
+    يستبدل قاعدة البيانات الحالية بالكامل بملف .db مرفوع من الإدمن.
+    خطوات أمان:
+    1. التحقق أن الملف هو قاعدة SQLite صالحة (PRAGMA integrity_check).
+    2. أخذ نسخة أمان من القاعدة الحالية قبل الاستبدال (في حال احتجنا التراجع).
+    3. استبدال الملف الفعلي.
+    لا تمسح هذه الدالة أي رسالة في قناة DB، فقط تتعامل مع الملف المحلي bot_data.db.
+    """
+    # 1) فحص سلامة الملف المرفوع
+    test_conn = sqlite3.connect(uploaded_db_path)
+    try:
+        result = test_conn.execute("PRAGMA integrity_check").fetchone()
+        if not result or result[0] != "ok":
+            raise ValueError("الملف المرفوع لا يبدو قاعدة بيانات SQLite صالحة (فشل integrity_check).")
+    finally:
+        test_conn.close()
+
+    # 2) نسخة أمان من القاعدة الحالية قبل الاستبدال
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    pre_restore_backup = os.path.join(BACKUP_DIR, f"pre_restore_{ts}.db")
+    if os.path.exists(DB_PATH):
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(pre_restore_backup)
+        src.backup(dst)
+        dst.close()
+        src.close()
+
+    # 3) الاستبدال الفعلي: نغلق أي اتصالات معلّقة، ثم ننسخ الملف الجديد فوق القديم
+    #    (shutil.copyfile يحافظ على نفس المسار DB_PATH الذي تتصل به كل دوال البوت)
+    for ext in ["", "-wal", "-shm"]:
+        stale = DB_PATH + ext
+        if ext and os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except Exception:
+                pass
+    shutil.copyfile(uploaded_db_path, DB_PATH)
 
 def get_user(tg_id):
     conn = db_conn()
@@ -868,6 +992,7 @@ def callback_handler(call):
                 InlineKeyboardButton("📋 سجل الإدمن", callback_data="admin_logs"),
                 InlineKeyboardButton("🔧 وضع الصيانة", callback_data="toggle_maintenance"),
                 InlineKeyboardButton("💾 نسخ احتياطي", callback_data="backup_db"),
+                InlineKeyboardButton("📤 رفع قاعدة بيانات", callback_data="upload_db_prompt"),
                 InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
             )
             bot.edit_message_text("⚙️ *لوحة الإدارة*", chat_id, message_id,
@@ -942,6 +1067,7 @@ def callback_handler(call):
                 InlineKeyboardButton("📋 سجل الإدمن", callback_data="admin_logs"),
                 InlineKeyboardButton("🔧 وضع الصيانة", callback_data="toggle_maintenance"),
                 InlineKeyboardButton("💾 نسخ احتياطي", callback_data="backup_db"),
+                InlineKeyboardButton("📤 رفع قاعدة بيانات", callback_data="upload_db_prompt"),
                 InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
             )
             bot.edit_message_text("⚙️ *لوحة الإدارة*", chat_id, message_id,
@@ -964,6 +1090,54 @@ def callback_handler(call):
                 bot.answer_callback_query(call.id, "✅ تم إنشاء النسخة وإرسالها.")
             except Exception as e:
                 bot.answer_callback_query(call.id, f"❌ خطأ: {e}", show_alert=True)
+
+        # ========== رفع/استرجاع قاعدة بيانات كاملة (يدوي فقط) ==========
+        elif data == "upload_db_prompt":
+            if not is_admin(tg_id):
+                return
+            user_states[tg_id] = "waiting_db_upload_file"
+            keyboard = InlineKeyboardMarkup()
+            keyboard.add(InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel"))
+            bot.edit_message_text(
+                "📤 *رفع قاعدة بيانات*\n\n"
+                "أرسل الآن ملف قاعدة البيانات (.db) لاستعادته.\n\n"
+                "⚠️ تحذير: هذا سيستبدل قاعدة البيانات الحالية بالكامل (المستخدمين، "
+                "التطبيقات، الإحالات، كل شيء) بعد طلب تأكيد منك.",
+                chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
+            )
+
+        elif data == "confirm_db_restore":
+            if not is_admin(tg_id):
+                return
+            pending = pending_db_restores.pop(tg_id, None)
+            if not pending or not os.path.exists(pending):
+                bot.answer_callback_query(call.id, "❌ انتهت صلاحية العملية، أعد رفع الملف.", show_alert=True)
+                return
+            try:
+                restore_database_from_file(pending)
+                log_admin_action(tg_id, "restore_db", f"تم استبدال القاعدة من ملف: {pending}")
+                bot.edit_message_text("✅ تم استبدال قاعدة البيانات بالكامل بنجاح.", chat_id, message_id)
+                bot.send_message(tg_id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(tg_id))
+            except Exception as e:
+                bot.edit_message_text(f"❌ فشل الاستبدال: {e}\n\nقاعدة البيانات القديمة لم تتأثر.", chat_id, message_id)
+            finally:
+                try:
+                    if os.path.exists(pending):
+                        os.remove(pending)
+                except Exception:
+                    pass
+
+        elif data == "cancel_db_restore":
+            if not is_admin(tg_id):
+                return
+            pending = pending_db_restores.pop(tg_id, None)
+            if pending and os.path.exists(pending):
+                try:
+                    os.remove(pending)
+                except Exception:
+                    pass
+            bot.edit_message_text("❌ تم إلغاء عملية الاستبدال. لم يتم تغيير أي شيء.", chat_id, message_id)
+            bot.send_message(tg_id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(tg_id))
 
         elif data == "edit_settings":
             if not is_admin(tg_id):
@@ -1118,6 +1292,59 @@ def start_command(message):
         return
 
     bot.send_message(tg_id, "مرحباً بك 🚀", reply_markup=main_menu_keyboard(tg_id))
+
+# ========== استقبال ملف قاعدة البيانات (.db) المرفوع من الإدمن لاستعادتها ==========
+@bot.message_handler(content_types=['document'],
+                     func=lambda m: is_admin(m.from_user.id)
+                     and user_states.get(m.from_user.id) == "waiting_db_upload_file")
+def receive_db_upload(message):
+    tg_id = message.from_user.id
+    file_name = message.document.file_name or ""
+    if not file_name.lower().endswith(".db"):
+        bot.reply_to(message, "❌ الملف يجب أن يكون بصيغة .db فقط. أعد الإرسال أو اضغط إلغاء.")
+        return
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        download_path = os.path.join(BACKUP_DIR, f"uploaded_{ts}.db")
+        file_info = bot.get_file(message.document.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        with open(download_path, 'wb') as f:
+            f.write(downloaded)
+    except Exception as e:
+        bot.reply_to(message, f"❌ فشل تنزيل الملف: {e}")
+        user_states.pop(tg_id, None)
+        return
+
+    # فحص سريع لسلامة الملف قبل عرض التأكيد
+    try:
+        check_conn = sqlite3.connect(download_path)
+        result = check_conn.execute("PRAGMA integrity_check").fetchone()
+        check_conn.close()
+        if not result or result[0] != "ok":
+            os.remove(download_path)
+            bot.reply_to(message, "❌ الملف ليس قاعدة بيانات SQLite صالحة. لم يتم تغيير أي شيء.")
+            user_states.pop(tg_id, None)
+            return
+    except Exception as e:
+        if os.path.exists(download_path):
+            os.remove(download_path)
+        bot.reply_to(message, f"❌ تعذّر قراءة الملف كقاعدة بيانات: {e}")
+        user_states.pop(tg_id, None)
+        return
+
+    pending_db_restores[tg_id] = download_path
+    user_states.pop(tg_id, None)
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(InlineKeyboardButton("✅ تأكيد الاستبدال", callback_data="confirm_db_restore"))
+    keyboard.add(InlineKeyboardButton("❌ إلغاء", callback_data="cancel_db_restore"))
+    bot.reply_to(message,
+        "⚠️ *تأكيد الاستبدال*\n\n"
+        f"الملف `{file_name}` تم استلامه وفحصه بنجاح.\n\n"
+        "هل أنت متأكد أنك تريد استبدال قاعدة البيانات الحالية بالكامل بهذا الملف؟\n"
+        "(سيتم أخذ نسخة أمان من القاعدة الحالية تلقائياً قبل الاستبدال تحسباً لأي خطأ)",
+        parse_mode='Markdown', reply_markup=keyboard
+    )
 
 # ========== استقبال ملف التطبيق من الإدمن ونشره تلقائياً في قناة DB ==========
 @bot.message_handler(content_types=['document', 'video', 'audio', 'photo'],
@@ -1351,7 +1578,8 @@ def edit_setting_value(message):
 if __name__ == "__main__":
     bot.set_my_commands([telebot.types.BotCommand("start", "بدء البوت")])
     threading.Thread(target=process_pending_referrals, daemon=True).start()
-    print("✅ البوت يعمل — نظام قناة DB مفعّل...")
+    threading.Thread(target=auto_backup, daemon=True).start()
+    print("✅ البوت يعمل — نظام قناة DB مفعّل (نسخ احتياطي تلقائي كل 30 دقيقة)...")
 
     while True:
         try:
