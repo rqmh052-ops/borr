@@ -468,8 +468,8 @@ def deliver_app_to_user(app_code: str, tg_id: int) -> bool:
         return False
     _, channel_msg_id, category, is_vip, name, downloads = info
     try:
-        # forward من قناة قاعدة البيانات مباشرة للمستخدم
-        bot.forward_message(
+        # نسخ الرسالة من قناة قاعدة البيانات للمستخدم بدون إظهار "محوّل من"
+        bot.copy_message(
             chat_id=tg_id,
             from_chat_id=DB_CHANNEL_ID,
             message_id=channel_msg_id
@@ -1175,7 +1175,7 @@ def receive_app_caption_and_publish(message):
         caption_text += f"\n\n{description}"
     if is_vip:
         caption_text = f"👑 VIP\n" + caption_text
-    caption_text += f"\n\n📁 {cat_name}"
+    caption_text += f"\n\n[تابع القناة]({FORCE_SUB_CHANNEL_URL})"
 
     try:
         # البوت ينشر الملف في قناة DB مع الوصف
