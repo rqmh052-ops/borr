@@ -45,6 +45,11 @@ user_states = {}
 pending_app_messages = {}   # يخزن مؤقتاً رسالة الملف الأصلية من الإدمن
 pending_db_restores = {}    # يخزن مؤقتاً مسار ملف .db المرفوع بانتظار تأكيد الاستبدال
 
+# يخزن مؤقتاً message_id لآخر رسالة "يجب الاشتراك" أُرسلت لكل مستخدم، بحيث لو
+# كرّر /start ضغطاً عدة مرات دون الاشتراك، تُحذف الرسالة القديمة ويُرسل تنبيه
+# جديد بدل تكديس عدة رسائل مطالبة بالاشتراك في الدردشة.
+last_force_sub_prompt = {}
+
 # مفتاح سري للتشفير الداخلي - لا يُشارك أبداً
 SECRET_KEY = secrets.token_hex(32)
 
@@ -233,6 +238,16 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE,
         admin_id INTEGER,
+        created_at TEXT
+    )''')
+
+    # ===================== أكواد الإحالة المختصرة (4 أرقام) =====================
+    # يحلّ هذا الجدول محل صيغة ref_{tg_id} الطويلة بالكامل. كل مستخدم يحصل على
+    # كود واحد ثابت من 4 أرقام عند أول استخدام، يُستعمل بدل الـ tg_id الكامل
+    # داخل رابط /start. لا حاجة للحفاظ على الصيغة القديمة الطويلة.
+    c.execute('''CREATE TABLE IF NOT EXISTS referral_codes (
+        code TEXT PRIMARY KEY,
+        tg_id INTEGER UNIQUE NOT NULL,
         created_at TEXT
     )''')
 
@@ -474,6 +489,14 @@ def update_balance(tg_id, amount):
     conn.commit()
     conn.close()
 
+def set_balance(tg_id, new_value: float):
+    """يضبط رصيد المستخدم على قيمة محددة مباشرة (يُستخدم في تعديل الرصيد من لوحة الإدارة)."""
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = ? WHERE tg_id=?", (new_value, tg_id))
+    conn.commit()
+    conn.close()
+
 def try_deduct_balance(tg_id, required: float) -> bool:
     """
     خصم ذرّي (atomic) للرصيد: الفحص والخصم يتمّان في استعلام SQL واحد،
@@ -521,6 +544,76 @@ def check_subscription(tg_id):
         return member.status in ['member', 'administrator', 'creator']
     except Exception:
         return False
+
+def force_sub_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("📢   اشترك في القناة   📢", url=FORCE_SUB_CHANNEL_URL))
+    keyboard.add(InlineKeyboardButton("🔄   تأكد الاشتراك   🔄", callback_data="check_subscription"))
+    return keyboard
+
+def send_force_sub_prompt(tg_id):
+    """
+    يرسل رسالة "يجب الاشتراك" للمستخدم، ويحذف أي رسالة مطالبة سابقة كانت
+    معلّقة له (لتفادي تكديس عدة رسائل متطابقة عند تكرار /start من مستخدم
+    غير مشترك). هذا يُغلق الثغرة المطلوبة في نظام الاشتراك الإجباري.
+    """
+    old_msg_id = last_force_sub_prompt.get(tg_id)
+    if old_msg_id:
+        try:
+            bot.delete_message(tg_id, old_msg_id)
+        except Exception:
+            pass  # الرسالة قد تكون محذوفة مسبقاً أو قديمة جداً للحذف، لا مشكلة
+
+    sent = bot.send_message(tg_id, "⚠️ يجب الاشتراك في القناة أولاً لاستخدام البوت:",
+                            reply_markup=force_sub_keyboard())
+    last_force_sub_prompt[tg_id] = sent.message_id
+
+# ======================= أكواد الإحالة المختصرة (4 أرقام) =======================
+def get_referral_code(tg_id: int) -> str:
+    """
+    يعيد كود الإحالة المختصر (4 أرقام) الخاص بالمستخدم، وينشئ كوداً جديداً
+    إن لم يكن لديه واحد بعد. الكود ثابت دائماً لنفس المستخدم بعد إنشائه.
+    🔒 يُنشأ الكود عبر إعادة محاولة عشوائية حتى عدم التعارض (مساحة 10000
+    احتمال كافية لعدد المستخدمين المتوقع لهذا النوع من البوتات).
+    """
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT code FROM referral_codes WHERE tg_id=?", (tg_id,))
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return row[0]
+
+    for _ in range(50):
+        code = f"{secrets.randbelow(10000):04d}"
+        try:
+            c.execute(
+                "INSERT INTO referral_codes (code, tg_id, created_at) VALUES (?, ?, ?)",
+                (code, tg_id, datetime.datetime.now().isoformat())
+            )
+            conn.commit()
+            conn.close()
+            return code
+        except sqlite3.IntegrityError:
+            # تعارض على الكود نفسه (نادر) أو على tg_id (سباق نادر بين طلبين
+            # متزامنين لنفس المستخدم) - نتحقق من الحالة الثانية أولاً.
+            c.execute("SELECT code FROM referral_codes WHERE tg_id=?", (tg_id,))
+            existing = c.fetchone()
+            if existing:
+                conn.close()
+                return existing[0]
+            continue
+    conn.close()
+    raise RuntimeError("تعذّر إنشاء كود إحالة فريد بعد عدة محاولات.")
+
+def resolve_referral_code(code: str) -> int | None:
+    """يحوّل كود الإحالة المختصر إلى tg_id الخاص بالمُحيل، أو None إن لم يوجد."""
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT tg_id FROM referral_codes WHERE code=?", (code,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 # 🔒 قفل يمنع تشغيل process_pending_referrals من أكثر من thread في نفس اللحظة
 # (كانت تُستدعى سابقاً في thread جديد مع كل /start، إضافة لتشغيلها الدوري في
@@ -746,17 +839,39 @@ def main_menu_keyboard(tg_id):
     buttons = [
         InlineKeyboardButton("📂 التطبيقات", callback_data="show_categories"),
         InlineKeyboardButton("👑 VIP", callback_data="show_vip"),
-        InlineKeyboardButton("💰 رصيدي", callback_data="show_balance"),
-        InlineKeyboardButton("🔗 رابط الدعوة", callback_data="get_referral_link"),
+        InlineKeyboardButton("💰 تجميع الرصيد", callback_data="show_balance"),
         InlineKeyboardButton("📨 طلب كسر / رفع", callback_data="make_request"),
         InlineKeyboardButton("🔍 بحث", callback_data="search_apps"),
     ]
     keyboard.add(*buttons[:2])
-    keyboard.add(*buttons[2:4])
+    keyboard.add(buttons[2])
+    keyboard.add(buttons[3])
     keyboard.add(buttons[4])
-    keyboard.add(buttons[5])
     if is_admin(tg_id):
         keyboard.add(InlineKeyboardButton("⚙️ لوحة الإدارة", callback_data="admin_panel"))
+    return keyboard
+
+def admin_panel_keyboard():
+    """
+    لوحة الإدارة الموحّدة. كانت هذه اللوحة مكرّرة بالكامل في مكانين (عرضها
+    الأول، وإعادة عرضها بعد toggle_maintenance) — تم توحيدها في دالة واحدة
+    لإزالة التكرار وتسهيل أي توسعة مستقبلية (إضافة زر جديد هنا يكفي).
+    """
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
+        InlineKeyboardButton("📥 الطلبات المعلقة", callback_data="view_requests"),
+        InlineKeyboardButton("📂 إدارة التصنيفات", callback_data="show_categories"),
+        InlineKeyboardButton("👑 إدارة VIP", callback_data="show_vip"),
+        InlineKeyboardButton("💳 تعديل رصيد مستخدم", callback_data="admin_edit_balance"),
+        InlineKeyboardButton("⚙️ الإعدادات", callback_data="edit_settings"),
+        InlineKeyboardButton("👥 المستخدمين", callback_data="admin_users"),
+        InlineKeyboardButton("📋 سجل الإدمن", callback_data="admin_logs"),
+        InlineKeyboardButton("🔧 وضع الصيانة", callback_data="toggle_maintenance"),
+        InlineKeyboardButton("💾 نسخ احتياطي", callback_data="backup_db"),
+        InlineKeyboardButton("📤 رفع قاعدة بيانات", callback_data="upload_db_prompt"),
+        InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
+    )
     return keyboard
 
 # ======================= معالج الأزرار المركزي =======================
@@ -776,10 +891,8 @@ def callback_handler(call):
         # التحقق من الاشتراك
         if data not in ['check_subscription', 'dummy']:
             if not check_subscription(tg_id):
-                keyboard = InlineKeyboardMarkup(row_width=1)
-                keyboard.add(InlineKeyboardButton("📢   اشترك في القناة   📢", url=FORCE_SUB_CHANNEL_URL))
-                keyboard.add(InlineKeyboardButton("🔄   تأكد الاشتراك   🔄", callback_data="check_subscription"))
-                bot.edit_message_text("⚠️ يجب الاشتراك في القناة:", chat_id, message_id, reply_markup=keyboard)
+                bot.edit_message_text("⚠️ يجب الاشتراك في القناة أولاً لاستخدام البوت:",
+                                      chat_id, message_id, reply_markup=force_sub_keyboard())
                 return
 
         # ========== القائمة الرئيسية ==========
@@ -788,6 +901,7 @@ def callback_handler(call):
 
         elif data == "check_subscription":
             if check_subscription(tg_id):
+                last_force_sub_prompt.pop(tg_id, None)
                 bot.edit_message_text("✅ تم التأكيد!", chat_id, message_id)
                 bot.send_message(tg_id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(tg_id))
             else:
@@ -1080,7 +1194,7 @@ def callback_handler(call):
                 chat_id, message_id
             )
 
-        # ========== الرصيد والإحالات ==========
+        # ========== تجميع الرصيد (الرصيد + كود الإحالة في صفحة واحدة) ==========
         elif data == "show_balance":
             user = get_user(tg_id)
             if not user:
@@ -1093,25 +1207,27 @@ def callback_handler(call):
             c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND status='pending'", (tg_id,))
             pending = c.fetchone()[0]
             conn.close()
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(InlineKeyboardButton("🔗 رابط الدعوة", callback_data="get_referral_link"))
+
+            ref_code = get_referral_code(tg_id)
+            bot_username = bot.get_me().username
+            ref_link = f"https://t.me/{bot_username}?start=ref_{ref_code}"
+
+            keyboard = InlineKeyboardMarkup(row_width=1)
+            keyboard.add(InlineKeyboardButton("📤 مشاركة البوت", switch_inline_query=ref_link))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+
             bot.edit_message_text(
-                f"💰 *الرصيد:* {balance} دولار\n"
+                f"💰 *الرصيد الحالي:* {balance} دولار\n"
                 f"📊 *الإحالات الناجحة:* {refs}\n"
                 f"⏳ *معلقة:* {pending}\n\n"
                 f"كل إحالة = 0.5 دولار\n"
                 f"• {get_setting('referrals_for_feature')} إحالات = طلب كسر/رفع\n"
-                f"• {get_setting('referrals_for_vip')} إحالات = VIP",
+                f"• {get_setting('referrals_for_vip')} إحالات = VIP\n\n"
+                f"➖➖➖➖➖➖➖➖➖➖\n"
+                f"🔗 *كود إحالتك:* `{ref_code}`\n"
+                f"رابط دعوتك:\n`{ref_link}`",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
             )
-
-        elif data == "get_referral_link":
-            link = f"https://t.me/{bot.get_me().username}?start=ref_{tg_id}"
-            keyboard = InlineKeyboardMarkup()
-            keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-            bot.edit_message_text(f"🔗 *رابط دعوتك:*\n`{link}`",
-                                  chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard)
 
         # ========== طلب كسر / رفع ==========
         elif data == "make_request":
@@ -1119,7 +1235,7 @@ def callback_handler(call):
             user = get_user(tg_id)
             if not user or user[2] < required:
                 keyboard = InlineKeyboardMarkup()
-                keyboard.add(InlineKeyboardButton("🔗 جلب إحالات", callback_data="get_referral_link"))
+                keyboard.add(InlineKeyboardButton("🔗 جلب إحالات", callback_data="show_balance"))
                 keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
                 bot.edit_message_text(f"❌ رصيدك غير كافٍ (تحتاج {required} دولار).",
                                       chat_id, message_id, reply_markup=keyboard)
@@ -1142,22 +1258,8 @@ def callback_handler(call):
         elif data == "admin_panel":
             if not is_admin(tg_id):
                 return
-            keyboard = InlineKeyboardMarkup(row_width=1)
-            keyboard.add(
-                InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
-                InlineKeyboardButton("📥 الطلبات المعلقة", callback_data="view_requests"),
-                InlineKeyboardButton("📂 إدارة التصنيفات", callback_data="show_categories"),
-                InlineKeyboardButton("👑 إدارة VIP", callback_data="show_vip"),
-                InlineKeyboardButton("⚙️ الإعدادات", callback_data="edit_settings"),
-                InlineKeyboardButton("👥 المستخدمين", callback_data="admin_users"),
-                InlineKeyboardButton("📋 سجل الإدمن", callback_data="admin_logs"),
-                InlineKeyboardButton("🔧 وضع الصيانة", callback_data="toggle_maintenance"),
-                InlineKeyboardButton("💾 نسخ احتياطي", callback_data="backup_db"),
-                InlineKeyboardButton("📤 رفع قاعدة بيانات", callback_data="upload_db_prompt"),
-                InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
-            )
             bot.edit_message_text("⚙️ *لوحة الإدارة*", chat_id, message_id,
-                                  parse_mode='Markdown', reply_markup=keyboard)
+                                  parse_mode='Markdown', reply_markup=admin_panel_keyboard())
 
         elif data == "admin_stats":
             if not is_admin(tg_id):
@@ -1192,6 +1294,41 @@ def callback_handler(call):
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
             bot.edit_message_text(text, chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard)
 
+        # ========== تعديل رصيد مستخدم عبر User ID فقط ==========
+        elif data == "admin_edit_balance":
+            if not is_admin(tg_id):
+                return
+            user_states[tg_id] = "waiting_balance_user_id"
+            keyboard = InlineKeyboardMarkup()
+            keyboard.add(InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel"))
+            bot.edit_message_text(
+                "💳 *تعديل رصيد مستخدم*\n\n"
+                "أرسل الآن User ID (معرّف المستخدم الرقمي) فقط:",
+                chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
+            )
+
+        # ========== اختيار نوع تعديل الرصيد (إضافة / خصم / تعيين) ==========
+        elif data.startswith("baladmin_op|"):
+            if not is_admin(tg_id):
+                return
+            _, target_id_str, op = data.split("|")
+            target_id = int(target_id_str)
+            user = get_user(target_id)
+            if not user:
+                bot.answer_callback_query(call.id, "❌ المستخدم غير مسجل في البوت.", show_alert=True)
+                return
+            op_labels = {"add": "➕ إضافة", "sub": "➖ خصم", "set": "✏️ تعيين قيمة"}
+            user_states[tg_id] = f"waiting_balance_amount|{target_id}|{op}"
+            keyboard = InlineKeyboardMarkup()
+            keyboard.add(InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel"))
+            bot.edit_message_text(
+                f"💳 المستخدم: `{target_id}`\n"
+                f"الرصيد الحالي: {user[2]} دولار\n"
+                f"العملية: {op_labels.get(op, op)}\n\n"
+                f"أرسل القيمة (رقم):",
+                chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
+            )
+
         elif data == "admin_logs":
             if not is_admin(tg_id):
                 return
@@ -1217,22 +1354,8 @@ def callback_handler(call):
             state_text = 'مفعّل' if new == '1' else 'معطّل'
             log_admin_action(tg_id, "toggle_maintenance", f"وضع الصيانة: {state_text}")
             bot.answer_callback_query(call.id, f"✅ وضع الصيانة {state_text}.")
-            keyboard = InlineKeyboardMarkup(row_width=1)
-            keyboard.add(
-                InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
-                InlineKeyboardButton("📥 الطلبات المعلقة", callback_data="view_requests"),
-                InlineKeyboardButton("📂 إدارة التصنيفات", callback_data="show_categories"),
-                InlineKeyboardButton("👑 إدارة VIP", callback_data="show_vip"),
-                InlineKeyboardButton("⚙️ الإعدادات", callback_data="edit_settings"),
-                InlineKeyboardButton("👥 المستخدمين", callback_data="admin_users"),
-                InlineKeyboardButton("📋 سجل الإدمن", callback_data="admin_logs"),
-                InlineKeyboardButton("🔧 وضع الصيانة", callback_data="toggle_maintenance"),
-                InlineKeyboardButton("💾 نسخ احتياطي", callback_data="backup_db"),
-                InlineKeyboardButton("📤 رفع قاعدة بيانات", callback_data="upload_db_prompt"),
-                InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
-            )
             bot.edit_message_text("⚙️ *لوحة الإدارة*", chat_id, message_id,
-                                  parse_mode='Markdown', reply_markup=keyboard)
+                                  parse_mode='Markdown', reply_markup=admin_panel_keyboard())
 
         elif data == "backup_db":
             if not is_admin(tg_id):
@@ -1425,14 +1548,12 @@ def start_command(message):
 
     referrer_id = None
     if ' ' in message.text:
-        payload = message.text.split(' ', 1)[1]
+        payload = message.text.split(' ', 1)[1].strip()
         if payload.startswith('ref_'):
-            try:
-                referrer_id = int(payload.split('_')[1])
-                if referrer_id == tg_id:
-                    referrer_id = None
-            except:
-                pass
+            ref_code = payload[4:]
+            resolved = resolve_referral_code(ref_code)
+            if resolved and resolved != tg_id:
+                referrer_id = resolved
 
     is_new = register_user(tg_id, username, referrer_id)
     if is_new and referrer_id:
@@ -1446,11 +1567,11 @@ def start_command(message):
         return
 
     if not check_subscription(tg_id):
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        keyboard.add(InlineKeyboardButton("📢   اشترك في القناة   📢", url=FORCE_SUB_CHANNEL_URL))
-        keyboard.add(InlineKeyboardButton("🔄   تأكد الاشتراك   🔄", callback_data="check_subscription"))
-        bot.send_message(tg_id, "⚠️ يجب الاشتراك في القناة:", reply_markup=keyboard)
+        send_force_sub_prompt(tg_id)
         return
+
+    # المستخدم مشترك فعلاً الآن - ننظف أي رسالة مطالبة قديمة كانت معلّقة له
+    last_force_sub_prompt.pop(tg_id, None)
 
     display_name = escape_markdown(message.from_user.first_name or username)
     name_link = f"[{display_name}](tg://user?id={tg_id})"
@@ -1757,7 +1878,95 @@ def receive_upload_desc(message):
     user_states.pop(tg_id, None)
     bot.send_message(ADMIN_ID, f"📩 طلب رفع جديد من @{message.from_user.username or tg_id}\nالتطبيق: {file_name}")
 
-# ========== تعديل إعداد ==========
+# ========== تعديل رصيد مستخدم: استقبال User ID ==========
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id)
+                     and user_states.get(m.from_user.id) == "waiting_balance_user_id")
+def receive_balance_target_id(message):
+    tg_id = message.from_user.id
+    raw = message.text.strip() if message.text else ""
+    if not raw.isdigit():
+        bot.reply_to(message, "❌ معرّف غير صالح، أرسل User ID رقمي فقط.")
+        return
+    target_id = int(raw)
+    user = get_user(target_id)
+    if not user:
+        bot.reply_to(message, "❌ هذا المستخدم غير مسجل في البوت.")
+        user_states.pop(tg_id, None)
+        bot.send_message(tg_id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(tg_id))
+        return
+
+    user_states.pop(tg_id, None)
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("➕ إضافة رصيد", callback_data=f"baladmin_op|{target_id}|add"))
+    keyboard.add(InlineKeyboardButton("➖ خصم رصيد", callback_data=f"baladmin_op|{target_id}|sub"))
+    keyboard.add(InlineKeyboardButton("✏️ تعيين قيمة الرصيد", callback_data=f"baladmin_op|{target_id}|set"))
+    keyboard.add(InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel"))
+    bot.reply_to(message,
+        f"✅ المستخدم موجود.\n"
+        f"🆔 `{target_id}` | @{user[1] or 'بدون'}\n"
+        f"💰 الرصيد الحالي: {user[2]} دولار\n\n"
+        f"اختر العملية:",
+        parse_mode='Markdown', reply_markup=keyboard
+    )
+
+# ========== تعديل رصيد مستخدم: استقبال القيمة وتنفيذ العملية ==========
+@bot.message_handler(func=lambda m: is_admin(m.from_user.id)
+                     and isinstance(user_states.get(m.from_user.id, ""), str)
+                     and user_states.get(m.from_user.id, "").startswith("waiting_balance_amount|"))
+def receive_balance_amount(message):
+    tg_id = message.from_user.id
+    state = user_states[tg_id]
+    _, target_id_str, op = state.split("|")
+    target_id = int(target_id_str)
+
+    raw_value = message.text.strip() if message.text else ""
+    try:
+        amount = float(raw_value)
+    except ValueError:
+        bot.reply_to(message, "❌ القيمة يجب أن تكون رقماً.")
+        return
+    if amount < 0:
+        bot.reply_to(message, "❌ أدخل قيمة موجبة فقط.")
+        return
+
+    # 🔒 إعادة التحقق من وجود المستخدم لحظة التنفيذ (دفاع ثانٍ، في حال حُذف
+    # المستخدم أو تغيّرت بياناته بين خطوة اختيار العملية وخطوة إدخال القيمة)
+    user = get_user(target_id)
+    if not user:
+        bot.reply_to(message, "❌ هذا المستخدم غير مسجل في البوت. تم إلغاء العملية.")
+        user_states.pop(tg_id, None)
+        bot.send_message(tg_id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(tg_id))
+        return
+
+    if op == "add":
+        update_balance(target_id, amount)
+        action_desc = f"إضافة {amount}"
+    elif op == "sub":
+        update_balance(target_id, -amount)
+        action_desc = f"خصم {amount}"
+    elif op == "set":
+        set_balance(target_id, amount)
+        action_desc = f"تعيين القيمة إلى {amount}"
+    else:
+        bot.reply_to(message, "❌ عملية غير معروفة.")
+        user_states.pop(tg_id, None)
+        return
+
+    new_balance = get_user(target_id)[2]
+    log_admin_action(tg_id, "edit_user_balance", f"user_id={target_id}, {action_desc}, new_balance={new_balance}")
+    user_states.pop(tg_id, None)
+
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 رجوع للوحة الإدارة", callback_data="admin_panel"))
+    bot.reply_to(message,
+        f"✅ تم تنفيذ العملية بنجاح.\n"
+        f"🆔 المستخدم: `{target_id}`\n"
+        f"العملية: {action_desc}\n"
+        f"💰 الرصيد الجديد: {new_balance} دولار",
+        parse_mode='Markdown', reply_markup=keyboard
+    )
+
+
 @bot.message_handler(func=lambda m: isinstance(user_states.get(m.from_user.id, ""), str)
                      and user_states.get(m.from_user.id, "").startswith("edit_setting|"))
 def edit_setting_value(message):
