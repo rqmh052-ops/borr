@@ -5,9 +5,7 @@ import datetime
 import time
 import os
 import hashlib
-import hmac
 import secrets
-import json
 import shutil
 import threading
 
@@ -41,6 +39,7 @@ DB_CHANNEL_ID = _require_env_int("DB_CHANNEL_ID")                  # قناة ق
 # =====================================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
+BOT_USERNAME = None   # يُملأ عند أول استدعاء في referrals_loop أو show_balance
 user_states = {}
 pending_app_messages = {}   # يخزن مؤقتاً رسالة الملف الأصلية من الإدمن
 pending_db_restores = {}    # يخزن مؤقتاً مسار ملف .db المرفوع بانتظار تأكيد الاستبدال
@@ -55,26 +54,10 @@ SECRET_KEY = secrets.token_hex(32)
 
 # ======================= نظام التشفير الداخلي =======================
 def generate_app_code(message_id: int) -> str:
-    """
-    ينشئ كوداً داخلياً قصيراً من 7 أرقام مرتبطاً بـ message_id.
-    الكود لا يمت بصلة ظاهرية للـ message_id.
-    """
     raw = f"{SECRET_KEY}:{message_id}:APP"
     digest = hashlib.sha256(raw.encode()).hexdigest()
-    # نأخذ 7 أرقام عشوائية من الـ hash
     num = int(digest[:14], 16) % 9_000_000 + 1_000_000
     return str(num)
-
-def decode_app_code(code: str) -> int | None:
-    """
-    يحوّل الكود القصير إلى message_id من قاعدة البيانات المحلية.
-    """
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT channel_msg_id FROM app_codes WHERE app_code=?", (code,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
 
 def generate_user_token(user_id: int, app_code: str) -> str:
     """
@@ -657,80 +640,74 @@ def _get_username(tg_id: int) -> str | None:
 
 def _add_violation(referrer_id: int, referred_id: int):
     """
-    يسجل مخالفة على المحيل:
-    - مخالفة 1       → تسجيل فقط
-    - مخالفة 2,3,4   → خصم 0.25$
-    - مخالفة 5       → تجميد الرصيد
+    مخالفة 1  → تسجيل فقط
+    مخالفة 2-4 → خصم 0.25$
+    مخالفة 5  → تجميد الرصيد
+    كل العمليات ذرّية بـ SQL واحد لمنع race condition.
     """
     conn = db_conn()
     c = conn.cursor()
+    # قراءة الحالة الحالية
     c.execute("SELECT violation_count, balance, is_frozen FROM users WHERE tg_id=?", (referrer_id,))
     row = c.fetchone()
-    if not row:
+    if not row or row[2]:   # غير موجود أو مجمَّد مسبقاً
         conn.close()
         return
-    v_count, balance, is_frozen = row
-    if is_frozen:
-        conn.close()
-        return
-
+    v_count, balance, _ = row
     new_count = v_count + 1
+
+    if new_count < VIOLATION_FREEZE:
+        if new_count == 1:
+            # تحذير فقط، بدون خصم
+            c.execute("UPDATE users SET violation_count=? WHERE tg_id=?", (new_count, referrer_id))
+        else:
+            # خصم ذري: نطرح من القيمة الحالية في SQL مباشرة
+            c.execute(
+                "UPDATE users SET violation_count=?, balance=MAX(0, balance-?) WHERE tg_id=?",
+                (new_count, DEDUCT_AMOUNT, referrer_id)
+            )
+    else:
+        # تجميد: نقل الرصيد كاملاً لـ frozen_balance ذرياً
+        c.execute(
+            "UPDATE users SET violation_count=?, frozen_balance=balance, balance=0, is_frozen=1 WHERE tg_id=?",
+            (new_count, referrer_id)
+        )
+    conn.commit()
+    conn.close()
+
+    # إشعار المحيل بعد إغلاق الاتصال
     referred_username = _get_username(referred_id)
     ref_link = _user_link(referred_id, referred_username)
-
-    if new_count == 1:
-        # مخالفة أولى: تسجيل فقط
-        c.execute("UPDATE users SET violation_count=? WHERE tg_id=?", (new_count, referrer_id))
-        conn.commit()
-        conn.close()
-        try:
+    try:
+        if new_count == 1:
             bot.send_message(
                 referrer_id,
                 f"⚠️ خرج {ref_link} من القناة قبل اكتمال ساعتين.\n"
                 f"تم تسجيل تحذير أول — لا خصم هذه المرة.",
                 parse_mode='HTML'
             )
-        except Exception:
-            pass
-
-    elif new_count < VIOLATION_FREEZE:
-        # مخالفة 2-4: خصم 0.25$
-        new_balance = max(0.0, balance - DEDUCT_AMOUNT)
-        c.execute("UPDATE users SET violation_count=?, balance=? WHERE tg_id=?",
-                  (new_count, new_balance, referrer_id))
-        conn.commit()
-        conn.close()
-        try:
+        elif new_count < VIOLATION_FREEZE:
             bot.send_message(
                 referrer_id,
                 f"⚠️ خرج {ref_link} من القناة قبل اكتمال ساعتين.\n"
                 f"تم خصم {DEDUCT_AMOUNT}$ من رصيدك بسبب تكرار الإحالات غير المكتملة.",
                 parse_mode='HTML'
             )
-        except Exception:
-            pass
-
-    else:
-        # مخالفة 5: تجميد الرصيد
-        c.execute("UPDATE users SET violation_count=?, frozen_balance=balance, balance=0, is_frozen=1 WHERE tg_id=?",
-                  (new_count, referrer_id))
-        conn.commit()
-        conn.close()
-        try:
+        else:
             bot.send_message(
                 referrer_id,
                 f"⛔ تم تجميد رصيدك بسبب تكرار المخالفات المتتالية ({VIOLATION_FREEZE} مرات).\n"
                 f"تواصل مع الإدارة لرفع التجميد.",
                 parse_mode='HTML'
             )
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 def _reset_violations(referrer_id: int):
-    """يصفّر عداد المخالفات عند اكتمال إحالة ناجحة."""
+    """يصفّر عداد المخالفات فقط إذا لم يكن المستخدم مجمَّداً."""
     conn = db_conn()
     c = conn.cursor()
-    c.execute("UPDATE users SET violation_count=0 WHERE tg_id=?", (referrer_id,))
+    c.execute("UPDATE users SET violation_count=0 WHERE tg_id=? AND is_frozen=0", (referrer_id,))
     conn.commit()
     conn.close()
 
@@ -766,7 +743,6 @@ def process_pending_referrals():
 
             # ── الحالة 1: pending ولم يشترك بعد ──────────────────────────
             if status == 'pending' and not subscribed:
-                # لا نفعل شيئاً، ننتظر حتى يشترك
                 continue
 
             # ── الحالة 2: pending واشترك → احتسب الإحالة فوراً ────────────
@@ -778,11 +754,7 @@ def process_pending_referrals():
                     WHERE id=?
                 """, (monitoring_start_dt, ref_id))
                 conn.commit()
-
-                # مكافأة فورية للمحيل
                 update_balance(referrer_id, REFERRAL_REWARD)
-
-                # إشعار المحيل باسم المدعو كرابط أزرق
                 referred_username = _get_username(referred_id)
                 ref_link = _user_link(referred_id, referred_username)
                 try:
@@ -799,13 +771,19 @@ def process_pending_referrals():
                 continue
 
             # ── الحالة 3: monitoring ──────────────────────────────────────
-            if status == 'monitoring' and monitoring_start:
+            if status == 'monitoring':
+                if not monitoring_start:
+                    # بيانات تالفة: نعيد تعيين وقت البدء الآن
+                    c.execute("UPDATE referrals SET monitoring_start_at=? WHERE id=?",
+                              (now.isoformat(), ref_id))
+                    conn.commit()
+                    continue
+
                 start_dt = datetime.datetime.fromisoformat(monitoring_start)
                 elapsed_hours = (now - start_dt).total_seconds() / 3600
 
-                still_subscribed = check_subscription(referred_id)
-
-                if not still_subscribed:
+                # subscribed قُرئت مرة واحدة فقط في أعلى الحلقة — نستخدمها مباشرة
+                if not subscribed:
                     # خرج قبل ساعتين → مخالفة
                     c.execute("UPDATE referrals SET status='violated' WHERE id=?", (ref_id,))
                     conn.commit()
@@ -822,7 +800,6 @@ def process_pending_referrals():
                               (referrer_id, referred_id))
                     conn.commit()
                     _reset_violations(referrer_id)
-
                     referred_username = _get_username(referred_id)
                     ref_link = _user_link(referred_id, referred_username)
                     try:
@@ -1325,7 +1302,7 @@ def callback_handler(call):
         # ========== VIP ==========
         elif data == "show_vip" or data.startswith("show_vip_p_"):
             user = get_user(tg_id)
-            if not user or not user[3]:
+            if not is_admin(tg_id) and (not user or not user[3]):
                 keyboard = InlineKeyboardMarkup()
                 keyboard.add(InlineKeyboardButton("🔓 احصل على VIP", callback_data="buy_vip"))
                 keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
@@ -1389,33 +1366,21 @@ def callback_handler(call):
             c = conn.cursor()
             c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND status='completed'", (tg_id,))
             refs = c.fetchone()[0]
-
-            # الاشتراكات المعلقة (pending + monitoring)
-            c.execute("""
-                SELECT referred_id, status, monitoring_start_at
-                FROM referrals
-                WHERE referrer_id=? AND status IN ('pending','monitoring')
-                ORDER BY id DESC LIMIT 5
-            """, (tg_id,))
-            pending_rows = c.fetchall()
             c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND status IN ('pending','monitoring')", (tg_id,))
             pending_count = c.fetchone()[0]
             conn.close()
 
             ref_code = get_referral_code(tg_id)
-            bot_username = bot.get_me().username
-            ref_link = f"https://t.me/{bot_username}?start=ref_{ref_code}"
+            bu = BOT_USERNAME or bot.get_me().username
+            ref_link = f"https://t.me/{bu}?start=ref_{ref_code}"
 
             keyboard = InlineKeyboardMarkup(row_width=1)
             keyboard.add(InlineKeyboardButton("📤 مشاركة البوت", switch_inline_query=ref_link))
-
-            # زر الاشتراكات المعلقة باللون الأزرق (عبر نص HTML وليس inline فقط)
             if pending_count > 0:
                 keyboard.add(InlineKeyboardButton(
                     f"🔵 الاشتراكات المعلقة ({pending_count})",
                     callback_data="show_pending_referrals"
                 ))
-
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
 
             frozen_line = f"\n❄️ *مجمد:* {frozen_bal:.2f}$" if is_frozen else ""
@@ -1647,8 +1612,6 @@ def callback_handler(call):
             settings = {
                 'الإحالات للطلب': 'referrals_for_feature',
                 'الإحالات للـVIP': 'referrals_for_vip',
-                'أيام صلاحية الإحالة': 'referral_expire_days',
-                'ساعات المهلة': 'grace_period_hours'
             }
             keyboard = InlineKeyboardMarkup(row_width=1)
             for label, key in settings.items():
@@ -1818,19 +1781,35 @@ def start_command(message):
                 referrer_id = resolved
                 has_ref_payload = True
 
+    # محاولة التسجيل — تُعيد True فقط إذا كان مستخدماً جديداً حقاً
     is_new = register_user(tg_id, username, referrer_id)
-
-    # تشغيل معالج الإحالات في الخلفية
-    threading.Thread(target=process_pending_referrals, daemon=True).start()
 
     if get_setting('maintenance_mode') == '1' and not is_admin(tg_id):
         bot.send_message(tg_id, "🔧 البوت في وضع الصيانة، عذراً.")
         return
 
-    # ── دخول عبر رابط إحالة ──────────────────────────────────────────────
-    if has_ref_payload:
+    # ── المستخدم القديم (سبق أن ضغط /start من قبل) ─────────────────────
+    # لا تُحتسب له أي إحالة، ويُعامَل دائماً كدخول عادي بغض النظر عن الرابط
+    if not is_new:
         if not check_subscription(tg_id):
-            # غير مشترك → رسالة الإحالة المخصصة (ليس رسالة الدخول العادي)
+            send_force_sub_prompt(tg_id)
+            return
+        last_force_sub_prompt.pop(tg_id, None)
+        display_name = escape_markdown(message.from_user.first_name or username)
+        name_link = f"[{display_name}](tg://user?id={tg_id})"
+        bot.send_message(
+            tg_id,
+            f"مرحباً بك {name_link} 🚀",
+            parse_mode='Markdown',
+            reply_markup=main_menu_keyboard(tg_id)
+        )
+        return
+
+    # ── مستخدم جديد دخل من رابط إحالة ──────────────────────────────────
+    if has_ref_payload and referrer_id:
+        if not check_subscription(tg_id):
+            # غير مشترك → رسالة الإحالة المخصصة
+            add_referral(referrer_id, tg_id)   # نسجّل الإحالة pending الآن
             old_msg_id = last_force_sub_prompt.get(tg_id)
             if old_msg_id:
                 try:
@@ -1843,15 +1822,10 @@ def start_command(message):
                 reply_markup=force_sub_keyboard()
             )
             last_force_sub_prompt[tg_id] = sent.message_id
-            # نسجل الإحالة كـ pending إن كان مستخدماً جديداً
-            if is_new and referrer_id:
-                add_referral(referrer_id, tg_id)
             return
         else:
-            # مشترك → نسجل الإحالة إن لزم ونشغل المعالج
-            if is_new and referrer_id:
-                add_referral(referrer_id, tg_id)
-            # تشغيل فوري لمعالجة الاشتراك الجديد
+            # مشترك → سجّل الإحالة ثم شغّل المعالج فوراً
+            add_referral(referrer_id, tg_id)
             threading.Thread(target=process_pending_referrals, daemon=True).start()
             last_force_sub_prompt.pop(tg_id, None)
             display_name = escape_markdown(message.from_user.first_name or username)
@@ -1864,7 +1838,7 @@ def start_command(message):
             )
             return
 
-    # ── دخول عادي (بدون رابط إحالة) ─────────────────────────────────────
+    # ── مستخدم جديد دخل بدون رابط إحالة ───────────────────────────────
     if not check_subscription(tg_id):
         send_force_sub_prompt(tg_id)
         return
@@ -2343,12 +2317,18 @@ def edit_setting_value(message):
 
 def referrals_loop():
     """يشغّل معالج الإحالات كل دقيقتين للمراقبة المستمرة."""
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            BOT_USERNAME = bot.get_me().username
+        except Exception:
+            pass
     while True:
         try:
             process_pending_referrals()
         except Exception as e:
             print(f"⚠️ خطأ في referrals_loop: {e}")
-        time.sleep(120)  # كل دقيقتين
+        time.sleep(120)
 
 # ======================= تشغيل البوت =======================
 if __name__ == "__main__":
