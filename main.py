@@ -12,11 +12,32 @@ import shutil
 import threading
 
 # ======================= الثوابت =======================
-BOT_TOKEN = "8737177889:AAGnnxZq9Yyptc1cdLTpEv5FoNbT5Jn8SQY"
-ADMIN_ID = 8287678319
-FORCE_SUB_CHANNEL_ID = -1003816376312    # قناة الاشتراك الإجباري
-FORCE_SUB_CHANNEL_URL = "https://t.me/Bayan_x777"
-DB_CHANNEL_ID = -1004325834135           # ← غيّر هذا لـ ID قناة قاعدة البيانات الخاصة بك
+# ⚠️ أمان: لا تكتب أي قيمة حساسة هنا مباشرة. كل القيم تُقرأ من متغيرات
+# البيئة (Environment Variables) التي تُضبط من لوحة تحكم الاستضافة
+# (مثل Railway -> Variables)، ولا تُكتب أبداً داخل الكود أو تُرفع لأي
+# مستودع (git). هذا يمنع تسرب التوكن في حال كان الكود علنياً أو مشارَكاً.
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"❌ متغير البيئة '{name}' غير موجود. أضِفه من إعدادات الاستضافة "
+            f"(Variables) قبل تشغيل البوت."
+        )
+    return value
+
+def _require_env_int(name: str) -> int:
+    value = _require_env(name)
+    try:
+        return int(value)
+    except ValueError:
+        raise RuntimeError(f"❌ متغير البيئة '{name}' يجب أن يكون رقماً صحيحاً.")
+
+BOT_TOKEN = _require_env("BOT_TOKEN")
+ADMIN_ID = _require_env_int("ADMIN_ID")
+FORCE_SUB_CHANNEL_ID = _require_env_int("FORCE_SUB_CHANNEL_ID")    # قناة الاشتراك الإجباري
+FORCE_SUB_CHANNEL_URL = _require_env("FORCE_SUB_CHANNEL_URL")
+DB_CHANNEL_ID = _require_env_int("DB_CHANNEL_ID")                  # قناة قاعدة البيانات
 # =====================================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
