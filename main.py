@@ -73,46 +73,78 @@ def decode_app_code(code: str) -> int | None:
 
 def generate_user_token(user_id: int, app_code: str) -> str:
     """
-    ينشئ token مؤقت (60 ثانية) يدمج user_id + app_code.
-    هذا الـ token هو الوحيد الذي يُستخدم لتحديد أي تطبيق لأي مستخدم.
+    ينشئ تذكرة عشوائية بحتة (ticket) صالحة لمرة واحدة ولمدة 60 ثانية.
+    التذكرة لا تحمل أي معلومة قابلة للقراءة أو الاستنتاج (لا user_id ولا app_code
+    ولا أي اشتقاق رياضي منهما) - فقط معرّف عشوائي 100% (secrets.token_urlsafe).
+    كل الربط الفعلي (من يملك حق تحميل أي تطبيق) يبقى مخزّناً في الذاكرة فقط
+    ولا يظهر إطلاقاً في نص الزر (callback_data) الذي قد يراه أي شخص بالضغط المطوّل.
     """
     expires = int(time.time()) + 60
-    raw = f"{SECRET_KEY}:{user_id}:{app_code}:{expires}"
-    sig = hmac.new(SECRET_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()[:16]
-    # نخزن مؤقتاً في الذاكرة
-    pending_tokens[f"{user_id}:{app_code}"] = {
+    ticket = secrets.token_urlsafe(12)  # عشوائي بحت، لا علاقة له بأي بيانات حقيقية
+    pending_tokens[ticket] = {
         "expires": expires,
-        "sig": sig,
         "app_code": app_code,
         "user_id": user_id
     }
-    return f"{user_id}:{app_code}:{sig}"
+    return ticket
 
-def validate_token(token: str, user_id: int) -> str | None:
+def validate_token(ticket: str, user_id: int) -> str | None:
     """
-    يتحقق من الـ token ويعيد app_code إذا كان صالحاً.
-    يُحذف الـ token فور استخدامه (one-time use).
+    يتحقق من التذكرة العشوائية ويعيد app_code إذا كانت صالحة لنفس المستخدم الذي طلبها.
+    تُحذف التذكرة فور استخدامها (one-time use) أو فور انتهاء صلاحيتها.
     """
-    parts = token.split(":")
-    if len(parts) != 3:
-        return None
-    tid, app_code, sig = parts
-    if int(tid) != user_id:
-        return None
-    key = f"{user_id}:{app_code}"
-    data = pending_tokens.get(key)
+    data = pending_tokens.get(ticket)
     if not data:
         return None
     if time.time() > data["expires"]:
-        pending_tokens.pop(key, None)
+        pending_tokens.pop(ticket, None)
         return None
-    if data["sig"] != sig:
+    if data["user_id"] != user_id:
+        # التذكرة موجودة لكنها مُصدرة لمستخدم آخر - لا نحذفها هنا حتى لا يتمكن
+        # مهاجم يخمّن تذاكر عشوائية من إفناء تذاكر مستخدمين آخرين (DoS بسيط)
         return None
-    pending_tokens.pop(key, None)  # استخدام لمرة واحدة
+    app_code = data["app_code"]
+    pending_tokens.pop(ticket, None)  # استخدام لمرة واحدة
     return app_code
 
 # تخزين مؤقت في الذاكرة للـ tokens
 pending_tokens = {}
+
+# ======================= حماية ضد التخمين المتكرر (Rate Limiting) =======================
+# ⚠️ هذا يحمي تحديداً مسار appv_{app_code}: لا يوجد طول مساحة كافٍ (7 أرقام
+# فقط) ليكون التخمين المنهجي مستحيلاً عملياً، خصوصاً أن callback_query يمكن
+# إرساله ببيانات تعسفية عبر مكتبات مثل Telethon/Pyrogram بغض النظر عن الزر
+# الظاهر فعلياً. هذا حد بسيط في الذاكرة (غير حرج كفاية لتبرير تعقيد قاعدة
+# بيانات إضافي) يوقف المحاولات الآلية المتلاحقة دون التأثير على الاستخدام
+# الطبيعي العادي.
+_failed_code_attempts = {}   # tg_id -> {"count": int, "blocked_until": float}
+_RATE_LIMIT_MAX_ATTEMPTS = 5
+_RATE_LIMIT_WINDOW_SECONDS = 60
+_RATE_LIMIT_BLOCK_SECONDS = 60
+
+def is_rate_limited(tg_id: int) -> bool:
+    """يتحقق هل المستخدم محظور مؤقتاً بسبب محاولات app_code خاطئة متكررة."""
+    entry = _failed_code_attempts.get(tg_id)
+    if not entry:
+        return False
+    if entry.get("blocked_until", 0) > time.time():
+        return True
+    return False
+
+def register_failed_code_attempt(tg_id: int):
+    """يسجّل محاولة app_code فاشلة، ويحظر المستخدم مؤقتاً عند تجاوز الحد."""
+    now = time.time()
+    entry = _failed_code_attempts.get(tg_id)
+    if not entry or now - entry.get("window_start", 0) > _RATE_LIMIT_WINDOW_SECONDS:
+        entry = {"count": 0, "window_start": now, "blocked_until": 0}
+    entry["count"] += 1
+    if entry["count"] >= _RATE_LIMIT_MAX_ATTEMPTS:
+        entry["blocked_until"] = now + _RATE_LIMIT_BLOCK_SECONDS
+    _failed_code_attempts[tg_id] = entry
+
+def reset_failed_code_attempts(tg_id: int):
+    """يصفّر العداد عند نجاح محاولة صحيحة."""
+    _failed_code_attempts.pop(tg_id, None)
 
 # ======================= قاعدة البيانات =======================
 DB_PATH = "bot_data.db"
@@ -442,6 +474,26 @@ def update_balance(tg_id, amount):
     conn.commit()
     conn.close()
 
+def try_deduct_balance(tg_id, required: float) -> bool:
+    """
+    خصم ذرّي (atomic) للرصيد: الفحص والخصم يتمّان في استعلام SQL واحد،
+    بدل قراءة الرصيد في بايثون ثم خصمه في خطوة منفصلة (TOCTOU race).
+    لو وصلت طلبيتان متزامنتان لنفس المستخدم، فقط واحدة تنجح فعلياً
+    (rowcount=1) والثانية تُرفض تلقائياً لأن الشرط balance>=required
+    يُقيَّم في نفس عملية الكتابة الذرّية بواسطة SQLite.
+    يُعيد True فقط إذا تم الخصم فعلياً.
+    """
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET balance = balance - ? WHERE tg_id=? AND balance >= ?",
+        (required, tg_id, required)
+    )
+    success = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
 def set_vip(tg_id):
     conn = db_conn()
     c = conn.cursor()
@@ -470,36 +522,49 @@ def check_subscription(tg_id):
     except Exception:
         return False
 
+# 🔒 قفل يمنع تشغيل process_pending_referrals من أكثر من thread في نفس اللحظة
+# (كانت تُستدعى سابقاً في thread جديد مع كل /start، إضافة لتشغيلها الدوري في
+# الخلفية، فكانت نسختان متزامنتان قادرتان على معالجة نفس صف pending مرتين
+# وتضاعف رصيد referrer_id قبل أن تُحدَّث الحالة لـ completed في أيهما).
+_referrals_lock = threading.Lock()
+
 def process_pending_referrals():
-    conn = db_conn()
-    c = conn.cursor()
-    now = datetime.datetime.now()
-    expire_days = int(get_setting('referral_expire_days') or 4)
-    grace_hours = int(get_setting('grace_period_hours') or 24)
+    if not _referrals_lock.acquire(blocking=False):
+        # تشغيل آخر قيد التنفيذ بالفعل؛ نتجاهل هذا الاستدعاء بأمان بدل الانتظار،
+        # حتى لا تتكدّس نداءات /start المتلاحقة بانتظار القفل.
+        return
+    try:
+        conn = db_conn()
+        c = conn.cursor()
+        now = datetime.datetime.now()
+        expire_days = int(get_setting('referral_expire_days') or 4)
+        grace_hours = int(get_setting('grace_period_hours') or 24)
 
-    c.execute("SELECT id, referrer_id, referred_id, created_at, channel_checked_date FROM referrals WHERE status='pending'")
-    pendings = c.fetchall()
-    for ref_id, referrer_id, referred_id, created_at, last_check in pendings:
-        created_time = datetime.datetime.fromisoformat(created_at)
-        days_passed = (now - created_time).days
+        c.execute("SELECT id, referrer_id, referred_id, created_at, channel_checked_date FROM referrals WHERE status='pending'")
+        pendings = c.fetchall()
+        for ref_id, referrer_id, referred_id, created_at, last_check in pendings:
+            created_time = datetime.datetime.fromisoformat(created_at)
+            days_passed = (now - created_time).days
 
-        if not check_subscription(referred_id):
-            if last_check:
-                last_time = datetime.datetime.fromisoformat(last_check)
-                if (now - last_time).total_seconds() > grace_hours * 3600:
-                    c.execute("UPDATE referrals SET status='cancelled' WHERE id=?", (ref_id,))
+            if not check_subscription(referred_id):
+                if last_check:
+                    last_time = datetime.datetime.fromisoformat(last_check)
+                    if (now - last_time).total_seconds() > grace_hours * 3600:
+                        c.execute("UPDATE referrals SET status='cancelled' WHERE id=?", (ref_id,))
+                        conn.commit()
+                else:
+                    c.execute("UPDATE referrals SET channel_checked_date=? WHERE id=?", (now.isoformat(), ref_id))
                     conn.commit()
             else:
-                c.execute("UPDATE referrals SET channel_checked_date=? WHERE id=?", (now.isoformat(), ref_id))
-                conn.commit()
-        else:
-            if days_passed >= expire_days:
-                c.execute("UPDATE referrals SET status='completed', completed_at=? WHERE id=?",
-                          (now.isoformat(), ref_id))
-                update_balance(referrer_id, 0.5)
-                c.execute("INSERT INTO banned_pairs (user1_id, user2_id) VALUES (?, ?)", (referrer_id, referred_id))
-                conn.commit()
-    conn.close()
+                if days_passed >= expire_days:
+                    c.execute("UPDATE referrals SET status='completed', completed_at=? WHERE id=?",
+                              (now.isoformat(), ref_id))
+                    update_balance(referrer_id, 0.5)
+                    c.execute("INSERT INTO banned_pairs (user1_id, user2_id) VALUES (?, ?)", (referrer_id, referred_id))
+                    conn.commit()
+        conn.close()
+    finally:
+        _referrals_lock.release()
 
 def get_categories():
     conn = db_conn()
@@ -635,6 +700,14 @@ def deliver_app_to_user(app_code: str, tg_id: int) -> bool:
     if not info:
         return False
     _, channel_msg_id, category, is_vip, name, downloads = info
+
+    # 🔒 طبقة دفاع ثانية (defense in depth): حتى لو وصلت تذكرة صالحة بأي شكل
+    # لمستخدم غير VIP لتطبيق VIP، هذا الفحص النهائي يمنع التسليم الفعلي.
+    if is_vip and not is_admin(tg_id):
+        user = get_user(tg_id)
+        if not (user and user[3]):
+            return False
+
     try:
         # نسخ الرسالة من قناة قاعدة البيانات للمستخدم بدون إظهار "محوّل من"
         bot.copy_message(
@@ -821,20 +894,43 @@ def callback_handler(call):
         # ========== عرض التطبيق مع زر التحميل ==========
         elif data.startswith("appv_"):
             app_code = data[5:]  # بعد "appv_"
+
+            # 🔒 حماية من تخمين app_code المتكرر (انظر شرح _failed_code_attempts بالأعلى)
+            if is_rate_limited(tg_id):
+                bot.answer_callback_query(call.id, "⏱️ محاولات كثيرة، حاول لاحقاً بعد دقيقة.", show_alert=True)
+                return
+
             info = get_app_info(app_code)
             if not info:
+                register_failed_code_attempt(tg_id)
                 bot.answer_callback_query(call.id, "التطبيق غير موجود.")
                 return
+            reset_failed_code_attempts(tg_id)
             _, channel_msg_id, category, is_vip, name, downloads = info
 
-            # نُنشئ token مؤقت مدمج: user_id + app_code
-            token = generate_user_token(tg_id, app_code)
-            safe_token = token.replace(":", "_")  # نجعله آمناً للـ callback_data
+            # 🔒 فحص صلاحية VIP الفعلي: is_vip في app_codes كان يُستخدم سابقاً فقط
+            # لتصفية القوائم، دون منع التحميل المباشر. الآن نتحقق أن المستخدم نفسه
+            # VIP فعلياً (أو إدمن) قبل السماح بإنشاء تذكرة تحميل لتطبيق VIP.
+            if is_vip and not is_admin(tg_id):
+                user = get_user(tg_id)
+                user_is_vip = bool(user and user[3])
+                if not user_is_vip:
+                    keyboard = InlineKeyboardMarkup()
+                    keyboard.add(InlineKeyboardButton("🔓 احصل على VIP", callback_data="buy_vip"))
+                    keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="show_vip"))
+                    bot.edit_message_text(
+                        "👑 هذا تطبيق VIP حصري.\nيلزمك تفعيل VIP أولاً للوصول إليه.",
+                        chat_id, message_id, reply_markup=keyboard
+                    )
+                    return
+
+            # نُنشئ تذكرة عشوائية بحتة (لا تحمل أي معلومة قابلة للقراءة) صالحة لمرة واحدة لمدة 60 ثانية
+            ticket = generate_user_token(tg_id, app_code)
 
             keyboard = InlineKeyboardMarkup(row_width=2)
             keyboard.add(InlineKeyboardButton(
                 "📥 تحميل",
-                callback_data=f"dl_{safe_token}"
+                callback_data=f"dl_{ticket}"
             ))
             if is_admin(tg_id):
                 keyboard.add(
@@ -858,12 +954,10 @@ def callback_handler(call):
                 reply_markup=keyboard
             )
 
-        # ========== زر التحميل الفعلي (مع Token) ==========
+        # ========== زر التحميل الفعلي (مع تذكرة عشوائية بحتة) ==========
         elif data.startswith("dl_"):
-            safe_token = data[3:]
-            token = safe_token.replace("_", ":", 2)  # نعيد ":" للمواضع الصحيحة
-
-            app_code = validate_token(token, tg_id)
+            ticket = data[3:]
+            app_code = validate_token(ticket, tg_id)
             if not app_code:
                 bot.answer_callback_query(call.id, "⏱️ انتهت صلاحية الزر، اضغط على التطبيق مرة أخرى.", show_alert=True)
                 return
@@ -1612,12 +1706,12 @@ def receive_search_query(message):
 def receive_crack_request(message):
     tg_id = message.from_user.id
     required = float(get_setting('referrals_for_feature') or 2) * 0.5
-    user = get_user(tg_id)
-    if not user or user[2] < required:
+    # 🔒 خصم ذرّي يمنع التزامن: لو وصل طلبان بنفس اللحظة (دبل-تاب مثلاً)،
+    # فقط واحد ينجح فعلياً، والآخر يُرفض بأمان بدل خصم مزدوج أو رصيد سالب.
+    if not try_deduct_balance(tg_id, required):
         bot.reply_to(message, "❌ رصيدك غير كافٍ.")
         user_states.pop(tg_id, None)
         return
-    update_balance(tg_id, -required)
     conn = db_conn()
     c = conn.cursor()
     c.execute("INSERT INTO user_requests (user_id, type, app_name, status, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1634,12 +1728,11 @@ def receive_crack_request(message):
 def handle_upload_request(message):
     tg_id = message.from_user.id
     required = float(get_setting('referrals_for_feature') or 2) * 0.5
-    user = get_user(tg_id)
-    if not user or user[2] < required:
+    # 🔒 نفس الحماية الذرّية المستخدمة في طلب الكسر
+    if not try_deduct_balance(tg_id, required):
         bot.reply_to(message, "❌ رصيدك غير كافٍ.")
         user_states.pop(tg_id, None)
         return
-    update_balance(tg_id, -required)
     file_id = message.document.file_id
     file_name = message.document.file_name or "تطبيق"
     user_states[tg_id] = f"waiting_upload_desc|{file_id}|{file_name}"
