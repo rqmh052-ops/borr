@@ -359,6 +359,10 @@ def init_db():
         'referrals_for_vip': '10',
         'maintenance_mode': '0',
 
+        # --- تكلفة الطلبات والـVIP بالنقاط (مستقلة عن نظام الإحالات) ---
+        'request_cost_points': '2',  # تكلفة طلب كسر/رفع بالنقاط
+        'vip_cost_points': '5',      # تكلفة شراء اشتراك VIP بالنقاط
+
         # --- الهدية اليومية ---
         'daily_gift_enabled': '1',
         'daily_gift_base': '1',          # قيمة الهدية في اليوم الأول من التتالي
@@ -1160,7 +1164,7 @@ def process_pending_referrals():
                     referrer_id,
                     f"✅ تم احتساب إحالة جديدة بنجاح!\n"
                     f"👤 {ref_link}\n"
-                    f"💰 +{REFERRAL_REWARD}$",
+                    f"💰 +{REFERRAL_REWARD} نقطة ⭐",
                     parse_mode='HTML'
                 )
             except Exception:
@@ -1896,9 +1900,10 @@ def callback_handler(call):
             user = get_user(tg_id)
             if not is_admin(tg_id) and (not user or not user[3]):
                 keyboard = InlineKeyboardMarkup()
-                keyboard.add(InlineKeyboardButton("🔓 احصل على VIP", callback_data="buy_vip"))
+                keyboard.add(InlineKeyboardButton("🔓 شراء VIP", callback_data="buy_vip"))
                 keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-                bot.edit_message_text("👑 *VIP*\nللوصول تحتاج إحالات.", chat_id, message_id,
+                bot.edit_message_text("👑 *VIP*\nفي الـ VIP تطبيقات أقوى بكثير من التطبيقات المجانية.",
+                                      chat_id, message_id,
                                       parse_mode='Markdown', reply_markup=keyboard)
                 return
             page = 1
@@ -1922,18 +1927,21 @@ def callback_handler(call):
                                   parse_mode='Markdown', reply_markup=keyboard)
 
         elif data == "buy_vip":
-            required = int(get_setting('referrals_for_vip') or 10)
-            conn = db_conn()
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND status='completed'", (tg_id,))
-            count = c.fetchone()[0]
-            conn.close()
-            if count >= required:
+            required = float(get_setting('vip_cost_points') or 5)
+            # 🔒 خصم ذرّي يمنع التزامن: لو ضغط المستخدم الزر مرتين بسرعة، لا يُخصم منه مرتين
+            if try_deduct_balance(tg_id, required):
                 set_vip(tg_id)
                 bot.edit_message_text("🎉 أصبحت VIP!", chat_id, message_id)
                 bot.send_message(tg_id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(tg_id))
             else:
-                bot.answer_callback_query(call.id, f"تحتاج {required} إحالة، لديك {count}.", show_alert=True)
+                user = get_user(tg_id)
+                balance = user[2] if user else 0
+                remaining = max(required - balance, 0)
+                bot.answer_callback_query(
+                    call.id,
+                    f"رصيدك غير كافٍ. تحتاج {required} نقطة ⭐، رصيدك الحالي {balance:.2f}، ينقصك {remaining:.2f}.",
+                    show_alert=True
+                )
 
         elif data == "add_vip_app":
             if not is_admin(tg_id):
@@ -1973,12 +1981,12 @@ def callback_handler(call):
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
 
             bot.edit_message_text(
-                f"💰 *الرصيد الحالي:* {balance:.2f}$"
+                f"💰 *الرصيد الحالي:* {balance:.2f} نقطة ⭐"
                 f"\n📊 *الإحالات الناجحة:* {refs}"
                 f"\n⏳ *معلقة:* {pending_count}\n\n"
-                f"كل إحالة = {REFERRAL_REWARD}$\n"
-                f"• {get_setting('referrals_for_feature')} إحالات = طلب كسر/رفع\n"
-                f"• {get_setting('referrals_for_vip')} إحالات = VIP\n\n"
+                f"كل إحالة = {REFERRAL_REWARD} نقطة ⭐\n"
+                f"• {get_setting('request_cost_points')} نقطة ⭐ = طلب كسر/رفع\n"
+                f"• {get_setting('vip_cost_points')} نقطة ⭐ = VIP\n\n"
                 f"➖➖➖➖➖➖➖➖➖➖\n"
                 f"🔗 *كود إحالتك:* `{ref_code}`\n"
                 f"رابط دعوتك:\n`{ref_link}`",
@@ -1987,13 +1995,13 @@ def callback_handler(call):
 
         # ========== طلب كسر / رفع ==========
         elif data == "make_request":
-            required = float(get_setting('referrals_for_feature') or 2) * 0.5
+            required = float(get_setting('request_cost_points') or 2)
             user = get_user(tg_id)
             if not user or user[2] < required:
                 keyboard = InlineKeyboardMarkup()
                 keyboard.add(InlineKeyboardButton("🔗 جلب إحالات", callback_data="show_balance"))
                 keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-                bot.edit_message_text(f"❌ رصيدك غير كافٍ (تحتاج {required} دولار).",
+                bot.edit_message_text(f"❌ رصيدك غير كافٍ (تحتاج {required} نقطة ⭐).",
                                       chat_id, message_id, reply_markup=keyboard)
                 return
             keyboard = InlineKeyboardMarkup(row_width=2)
@@ -2028,7 +2036,7 @@ def callback_handler(call):
             bonus_line = "\n🎉 بونص إحالة اليوم مُضاف!" if did_referral_today else ""
             bot.edit_message_text(
                 f"🎁 *تم استلام هديتك اليومية!*\n\n"
-                f"💰 المبلغ: {amount}$\n"
+                f"💰 المبلغ: {amount} نقطة ⭐\n"
                 f"🔥 أيام متتالية: {new_streak}"
                 f"{bonus_line}\n\n"
                 f"عُد غداً لتزيد التتالي وتحصل على مبلغ أكبر!",
@@ -2067,13 +2075,13 @@ def callback_handler(call):
             received, tax = calculate_transfer(amount)
             bot.edit_message_text(
                 f"✅ *تم التحويل بنجاح*\n\n"
-                f"📤 أرسلت: {amount}$\n"
-                f"💸 الضريبة: {tax}$\n"
-                f"📥 استلم المستخدم: {received}$",
+                f"📤 أرسلت: {amount} نقطة ⭐\n"
+                f"💸 الضريبة: {tax} نقطة ⭐\n"
+                f"📥 استلم المستخدم: {received} نقطة ⭐",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
             )
             try:
-                bot.send_message(target_id, f"💸 وصلتك حوالة بقيمة {received}$ من مستخدم آخر!")
+                bot.send_message(target_id, f"💸 وصلتك حوالة بقيمة {received} نقطة ⭐ من مستخدم آخر!")
             except Exception:
                 pass
 
@@ -2120,7 +2128,7 @@ def callback_handler(call):
                                       chat_id, message_id, reply_markup=keyboard)
                 return
             for t_id, title, desc, reward in tasks:
-                keyboard.add(InlineKeyboardButton(f"📌 {title} (+{reward}$)", callback_data=f"view_task|{t_id}"))
+                keyboard.add(InlineKeyboardButton(f"📌 {title} (+{reward} نقطة ⭐)", callback_data=f"view_task|{t_id}"))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
             bot.edit_message_text("📋 *المهام المتاحة:*\nاختر مهمة لعرض تفاصيلها:",
                                   chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard)
@@ -2138,7 +2146,7 @@ def callback_handler(call):
             keyboard.add(InlineKeyboardButton("✅ تم الإنجاز، استلم المكافأة", callback_data=f"complete_task|{t_id}"))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="show_tasks"))
             bot.edit_message_text(
-                f"📌 *{safe_title}*\n\n{safe_desc or 'بدون وصف'}\n\n💰 المكافأة: {reward}$\n\n"
+                f"📌 *{safe_title}*\n\n{safe_desc or 'بدون وصف'}\n\n💰 المكافأة: {reward} نقطة ⭐\n\n"
                 f"اضغط الزر أدناه بعد إتمام المهمة فعلياً لاستلام المكافأة.",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
             )
@@ -2153,7 +2161,7 @@ def callback_handler(call):
                 bot.edit_message_text("❌ تعذّر احتساب هذه المهمة (ربما أنجزتها من قبل أو لم تعد متاحة).",
                                       chat_id, message_id, reply_markup=keyboard)
                 return
-            bot.edit_message_text(f"✅ تم منحك {reward}$ على إنجاز المهمة!",
+            bot.edit_message_text(f"✅ تم منحك {reward} نقطة ⭐ على إنجاز المهمة!",
                                   chat_id, message_id, reply_markup=keyboard)
 
         # ========== إدارة المهام (إدمن) ==========
@@ -2164,7 +2172,7 @@ def callback_handler(call):
             keyboard = InlineKeyboardMarkup(row_width=1)
             for t_id, title, reward, active in tasks:
                 status = "🟢" if active else "🔴"
-                keyboard.add(InlineKeyboardButton(f"{status} {title} ({reward}$)", callback_data=f"admin_task_view|{t_id}"))
+                keyboard.add(InlineKeyboardButton(f"{status} {title} ({reward} نقطة ⭐)", callback_data=f"admin_task_view|{t_id}"))
             keyboard.add(InlineKeyboardButton("➕ إضافة مهمة جديدة", callback_data="admin_add_task"))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
             bot.edit_message_text("📋 *إدارة المهام*\n\nاضغط على مهمة للتعديل، أو أضف مهمة جديدة:",
@@ -2203,7 +2211,7 @@ def callback_handler(call):
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="admin_tasks"))
             bot.edit_message_text(
                 f"📌 *{safe_title}*\n\n{safe_desc or 'بدون وصف'}\n\n"
-                f"💰 المكافأة: {reward}$\n"
+                f"💰 المكافأة: {reward} نقطة ⭐\n"
                 f"الحالة: {status_label}\n"
                 f"👥 عدد المنجزين: {completions}",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
@@ -2492,6 +2500,8 @@ def callback_handler(call):
             settings = {
                 'الإحالات للطلب': 'referrals_for_feature',
                 'الإحالات للـVIP': 'referrals_for_vip',
+                'تكلفة الطلب (نقاط)': 'request_cost_points',
+                'تكلفة VIP (نقاط)': 'vip_cost_points',
             }
             keyboard = InlineKeyboardMarkup(row_width=1)
             for label, key in settings.items():
@@ -2509,9 +2519,9 @@ def callback_handler(call):
                 "✅ مفعّلة (اضغط للإيقاف)" if enabled else "❌ متوقفة (اضغط للتفعيل)",
                 callback_data="toggle_feature|daily_gift_enabled"
             ))
-            keyboard.add(InlineKeyboardButton(f"💰 القيمة الأساسية: {get_setting('daily_gift_base')}$",
+            keyboard.add(InlineKeyboardButton(f"💰 القيمة الأساسية: {get_setting('daily_gift_base')} نقطة ⭐",
                                               callback_data="editsetting|daily_gift_base"))
-            keyboard.add(InlineKeyboardButton(f"📈 الزيادة لكل يوم: {get_setting('daily_gift_increment')}$",
+            keyboard.add(InlineKeyboardButton(f"📈 الزيادة لكل يوم: {get_setting('daily_gift_increment')} نقطة ⭐",
                                               callback_data="editsetting|daily_gift_increment"))
             keyboard.add(InlineKeyboardButton(f"🔝 أقصى تتالي: {get_setting('daily_gift_max_streak')} يوم",
                                               callback_data="editsetting|daily_gift_max_streak"))
@@ -2541,12 +2551,12 @@ def callback_handler(call):
             ))
             keyboard.add(InlineKeyboardButton(f"💸 نسبة الضريبة: {get_setting('transfer_tax_percent')}%",
                                               callback_data="editsetting|transfer_tax_percent"))
-            keyboard.add(InlineKeyboardButton(f"🔢 أقل مبلغ للتحويل: {get_setting('transfer_min_amount')}$",
+            keyboard.add(InlineKeyboardButton(f"🔢 أقل مبلغ للتحويل: {get_setting('transfer_min_amount')} نقطة ⭐",
                                               callback_data="editsetting|transfer_min_amount"))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="edit_settings"))
             bot.edit_message_text(
                 "💸 *إعدادات التحويل*\n\n"
-                "مثال: تحويل 10$ بضريبة 20% ← المستلم يستلم 8$.",
+                "مثال: تحويل 10 نقطة ⭐ بضريبة 20% ← المستلم يستلم 8 نقطة ⭐.",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
             )
 
@@ -2736,8 +2746,8 @@ def callback_handler(call):
                 # القديمة المُنشأة قبل إضافة هذا العمود.
                 refund = deducted_amount if deducted_amount else 1.0
                 update_balance(user_id, refund)
-                bot.send_message(user_id, f"❌ تم رفض طلب '{name}'، تم إعادة رصيدك ({refund}$).")
-                log_admin_action(tg_id, "reject_request", f"{req_id} - {name} - استرجاع {refund}$")
+                bot.send_message(user_id, f"❌ تم رفض طلب '{name}'، تم إعادة رصيدك ({refund} نقطة ⭐).")
+                log_admin_action(tg_id, "reject_request", f"{req_id} - {name} - استرجاع {refund} نقطة ⭐")
             bot.edit_message_text("❌ تم الرفض وإعادة الرصيد.", chat_id, message_id,
                                   reply_markup=InlineKeyboardMarkup().add(
                                       InlineKeyboardButton("🔙 رجوع", callback_data="view_requests")))
@@ -2920,7 +2930,7 @@ def _try_redeem_gift(tg_id: int, gift_code: str):
     if result == "ok":
         info = get_gift_link(gift_code)
         points = info[1] if info else None
-        points_txt = f"{points:.2f}$" if points is not None else ""
+        points_txt = f"{points:.2f} نقطة ⭐" if points is not None else ""
         bot.send_message(tg_id, f"🎁 تم تفعيل رابط الهدية بنجاح! تم إضافة {points_txt} لرصيدك.")
     elif result == "already":
         bot.send_message(tg_id, "ℹ️ سبق أن استخدمت رابط الهدية هذا.")
@@ -3304,7 +3314,7 @@ def receive_crack_request(message):
         user_states.pop(tg_id, None)
         bot.reply_to(message, "🚫 تم حظرك من استخدام البوت.")
         return
-    required = float(get_setting('referrals_for_feature') or 2) * 0.5
+    required = float(get_setting('request_cost_points') or 2)
     # 🔒 خصم ذرّي يمنع التزامن: لو وصل طلبان بنفس اللحظة (دبل-تاب مثلاً)،
     # فقط واحد ينجح فعلياً، والآخر يُرفض بأمان بدل خصم مزدوج أو رصيد سالب.
     if not try_deduct_balance(tg_id, required):
@@ -3331,7 +3341,7 @@ def handle_upload_request(message):
         user_states.pop(tg_id, None)
         bot.reply_to(message, "🚫 تم حظرك من استخدام البوت.")
         return
-    required = float(get_setting('referrals_for_feature') or 2) * 0.5
+    required = float(get_setting('request_cost_points') or 2)
     # 🔒 نفس الحماية الذرّية المستخدمة في طلب الكسر
     if not try_deduct_balance(tg_id, required):
         bot.reply_to(message, "❌ رصيدك غير كافٍ.")
@@ -3574,7 +3584,7 @@ def receive_gift_points(message):
     keyboard.add(InlineKeyboardButton("🔙 رجوع للوحة الإدارة", callback_data="admin_panel"))
     bot.reply_to(message,
         f"✅ *تم إنشاء رابط الهدية بنجاح*\n\n"
-        f"💰 النقاط لكل استخدام: {points}$\n"
+        f"💰 النقاط لكل استخدام: {points} نقطة ⭐\n"
         f"👥 عدد الاستخدامات: {max_uses}\n\n"
         f"🔗 الرابط:\n`{gift_link}`\n\n"
         f"ملاحظة: أي مستخدم جديد كلياً يفتح الرابط سيُطلب منه الاشتراك بالقناة أولاً قبل استلام الهدية.",
@@ -3634,7 +3644,7 @@ def receive_transfer_amount(message):
 
     min_amount = float(get_setting('transfer_min_amount') or 1)
     if amount < min_amount:
-        bot.reply_to(message, f"❌ أقل مبلغ للتحويل هو {min_amount}$.")
+        bot.reply_to(message, f"❌ أقل مبلغ للتحويل هو {min_amount} نقطة ⭐.")
         return
 
     user = get_user(tg_id)
@@ -3651,13 +3661,13 @@ def receive_transfer_amount(message):
     keyboard.add(InlineKeyboardButton("✅ تأكيد التحويل", callback_data="transfer_confirm"))
     keyboard.add(InlineKeyboardButton("❌ إلغاء", callback_data="transfer_cancel"))
 
-    tax_line = f"💸 الضريبة ({get_setting('transfer_tax_percent')}%): {tax}$\n" if tax > 0 else ""
+    tax_line = f"💸 الضريبة ({get_setting('transfer_tax_percent')}%): {tax} نقطة ⭐\n" if tax > 0 else ""
     bot.reply_to(message,
         f"📋 *تأكيد التحويل*\n\n"
         f"👤 المستلم: `{target_id}`\n"
-        f"📤 المبلغ المُرسَل: {amount}$\n"
+        f"📤 المبلغ المُرسَل: {amount} نقطة ⭐\n"
         f"{tax_line}"
-        f"📥 المبلغ الذي سيستلمه: {received}$\n\n"
+        f"📥 المبلغ الذي سيستلمه: {received} نقطة ⭐\n\n"
         f"هل تؤكد التحويل؟",
         parse_mode='Markdown', reply_markup=keyboard
     )
@@ -3714,7 +3724,7 @@ def receive_task_reward(message):
     bot.reply_to(message,
         f"✅ *تم إنشاء المهمة بنجاح*\n\n"
         f"📌 {escape_markdown(title)}\n"
-        f"💰 المكافأة: {reward}$",
+        f"💰 المكافأة: {reward} نقطة ⭐",
         parse_mode='Markdown', reply_markup=keyboard
     )
 
