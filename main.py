@@ -386,6 +386,8 @@ def init_db():
         'ai_search_enabled': '1',
         'ai_search_max_concurrent': '4',   # أقصى عدد طلبات متزامنة لمحرك الذكاء الصناعي
         'ai_search_timeout_seconds': '12', # أقصى وقت انتظار لكل طلب قبل اعتباره فاشلاً
+        'ai_search_min_chars': '2',        # أدنى عدد أحرف مقبول في استعلام البحث
+        'ai_search_max_chars': '80',       # أقصى عدد أحرف مقبول في استعلام البحث
     }
     for key, val in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
@@ -2011,8 +2013,20 @@ def callback_handler(call):
             bot.edit_message_text("📨 اختر نوع الطلب:", chat_id, message_id, reply_markup=keyboard)
 
         elif data == "request_crack":
-            user_states[tg_id] = "waiting_crack_request"
-            bot.edit_message_text("✏️ أرسل اسم التطبيق:", chat_id, message_id)
+            required = float(get_setting('request_cost_points') or 2)
+            user = get_user(tg_id)
+            if not user or user[2] < required:
+                bot.answer_callback_query(call.id, f"❌ رصيدك غير كافٍ (تحتاج {required} نقطة ⭐).", show_alert=True)
+                return
+            user_states[tg_id] = "waiting_crack_apk_file"
+            keyboard_c = InlineKeyboardMarkup()
+            keyboard_c.add(InlineKeyboardButton("❌ إلغاء", callback_data="main_menu"))
+            bot.edit_message_text(
+                "📎 *طلب كسر تطبيق*\n\n"
+                "أرسل ملف التطبيق مباشرةً (.apk أو .apks فقط).\n"
+                "⚠️ ملفات من أي نوع آخر لن تُقبل.",
+                chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard_c
+            )
 
         elif data == "request_upload":
             user_states[tg_id] = "waiting_upload_file"
@@ -2257,7 +2271,7 @@ def callback_handler(call):
                 f"👑 تطبيقات VIP: {tv}\n"
                 f"📨 طلبات معلقة: {pr}\n"
                 f"🔗 إحالات ناجحة: {tr}\n"
-                f"💰 إجمالي الرصيد: {tb:.1f} دولار",
+                f"💰 إجمالي الرصيد: {tb:.1f} نقطة ⭐",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
             )
 
@@ -2311,7 +2325,7 @@ def callback_handler(call):
             keyboard.add(InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel"))
             bot.edit_message_text(
                 f"💳 المستخدم: `{target_id}`\n"
-                f"الرصيد الحالي: {user[2]} دولار\n"
+                f"الرصيد الحالي: {user[2]} نقطة ⭐\n"
                 f"العملية: {op_labels.get(op, op)}\n\n"
                 f"أرسل القيمة (رقم):",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
@@ -2604,6 +2618,14 @@ def callback_handler(call):
                 f"⏱️ مهلة الطلب (ثانية): {get_setting('ai_search_timeout_seconds')}",
                 callback_data="editsetting|ai_search_timeout_seconds"
             ))
+            keyboard.add(InlineKeyboardButton(
+                f"🔡 أدنى أحرف للبحث: {get_setting('ai_search_min_chars') or '2'}",
+                callback_data="editsetting|ai_search_min_chars"
+            ))
+            keyboard.add(InlineKeyboardButton(
+                f"🔠 أقصى أحرف للبحث: {get_setting('ai_search_max_chars') or '80'}",
+                callback_data="editsetting|ai_search_max_chars"
+            ))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="edit_settings"))
             bot.edit_message_text(
                 "🤖 *إعدادات البحث بالذكاء الصناعي*\n\n"
@@ -2677,8 +2699,29 @@ def callback_handler(call):
             keyboard.add(InlineKeyboardButton("✅ موافقة", callback_data=f"approve_req_{req_id}"))
             keyboard.add(InlineKeyboardButton("❌ رفض", callback_data=f"reject_req_{req_id}"))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="view_requests"))
-            text = f"طلب #{req_id}\nالمستخدم: {req[0]}\nالنوع: {req[1]}\nالاسم: {req[2]}\nالوصف: {req[3] or 'لا يوجد'}"
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard)
+            user_id_r, typ_r, app_name_r, desc_r, file_id_r = req
+            if typ_r == 'crack' and file_id_r and file_id_r.startswith('CRACK_CHAN:'):
+                crack_msg_id = int(file_id_r.split(':')[1])
+                try:
+                    bot.copy_message(
+                        chat_id=tg_id,
+                        from_chat_id=DB_CHANNEL_ID,
+                        message_id=crack_msg_id,
+                        protect_content=True,
+                        caption=f"🔒 ملف APK | طلب #{req_id} | مستخدم: {user_id_r}"
+                    )
+                except Exception as _e:
+                    bot.send_message(tg_id, f"⚠️ تعذّر استرداد الملف من القناة: {_e}")
+                text = (f"🔨 *طلب كسر #{req_id}*\n"
+                        f"المستخدم: {user_id_r}\n"
+                        f"الملف: {app_name_r}\n"
+                        f"_الملف أُرسل أعلاه (محمي)_")
+                bot.send_message(tg_id, text, parse_mode='Markdown', reply_markup=keyboard)
+            else:
+                text = (f"طلب #{req_id}\nالمستخدم: {user_id_r}\n"
+                        f"النوع: {typ_r}\nالاسم: {app_name_r}\n"
+                        f"الوصف: {desc_r or 'لا يوجد'}")
+                bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard)
 
         elif data.startswith("approve_req_"):
             if not is_admin(tg_id):
@@ -3236,12 +3279,19 @@ def receive_ai_search_query(message):
         return
 
     query = message.text.strip() if message.text else ""
-    if len(query) < 2:
-        bot.reply_to(message, "❌ اكتب وصفاً أكثر من حرف.")
+    min_chars = int(float(get_setting('ai_search_min_chars') or 2))
+    max_chars = int(float(get_setting('ai_search_max_chars') or 80))
+    if len(query) < min_chars:
+        bot.reply_to(message, f"❌ اكتب وصفاً لا يقل عن {min_chars} أحرف.")
+        return
+    if len(query) > max_chars:
+        bot.reply_to(message, f"❌ الوصف طويل جداً (الحد الأقصى {max_chars} حرف).")
         return
 
     user_states.pop(tg_id, None)
     thinking_msg = bot.reply_to(message, "🤖 جاري البحث...")
+    _ai_user_id = tg_id
+    _ai_username = message.from_user.username or ''
 
     def run_search():
         app_code = ai_search_app(query)
@@ -3263,7 +3313,34 @@ def receive_ai_search_query(message):
                     "❌ لم أجد نتيجة مطابقة، يرجى البحث يدوياً عبر التصنيفات.",
                     tg_id, thinking_msg.message_id, reply_markup=keyboard
                 )
+                # تسجيل في القناة: لا نتيجة
+                try:
+                    _un_log = f'@{_ai_username}' if _ai_username else str(_ai_user_id)
+                    bot.send_message(
+                        DB_CHANNEL_ID,
+                        f'🤖 سجل بحث ذكي\n'
+                        f'👤 {_un_log}\n'
+                        f'🔍 "{query}"\n'
+                        f'❌ لا توجد نتيجة',
+                        disable_notification=True
+                    )
+                except Exception:
+                    pass
                 return
+
+            # تسجيل في القناة: وُجدت نتيجة
+            try:
+                _un_log = f'@{_ai_username}' if _ai_username else str(_ai_user_id)
+                bot.send_message(
+                    DB_CHANNEL_ID,
+                    f'🤖 سجل بحث ذكي\n'
+                    f'👤 {_un_log}\n'
+                    f'🔍 "{query}"\n'
+                    f'📱 {info[4]}',
+                    disable_notification=True
+                )
+            except Exception:
+                pass
 
             # نعرض بطاقة التطبيق بنفس الشكل والمسار المستخدم عند الضغط على
             # تطبيق من القائمة يدوياً (appv_{app_code})، بإعادة استخدام نفس
@@ -3305,31 +3382,92 @@ def receive_ai_search_query(message):
 
 
 
-# ========== طلب كسر ==========
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_crack_request")
-def receive_crack_request(message):
+# ========== طلب كسر — استقبال ملف APK/APKs ==========
+@bot.message_handler(
+    content_types=['document'],
+    func=lambda m: user_states.get(m.from_user.id) == 'waiting_crack_apk_file'
+)
+def receive_crack_apk_file(message):
     tg_id = message.from_user.id
-    # 🔒 دفاع ثانٍ: لو حُظر المستخدم بعد دخوله هذه الحالة وقبل إرسال الرسالة
     if not is_admin(tg_id) and is_user_banned(tg_id):
         user_states.pop(tg_id, None)
-        bot.reply_to(message, "🚫 تم حظرك من استخدام البوت.")
+        bot.reply_to(message, '🚫 تم حظرك من استخدام البوت.')
         return
+
+    # التحقق من نوع الملف (APK أو APKs فقط)
+    file_name = (message.document.file_name or '').strip()
+    ext = file_name.lower().rsplit('.', 1)[-1] if '.' in file_name else ''
+    if ext not in ('apk', 'apks'):
+        bot.reply_to(
+            message,
+            '❌ الملف غير مقبول.\n'
+            'يُقبل فقط ملفات APK أو APKS.\n'
+            'أرسل الملف بالامتداد الصحيح (.apk أو .apks):'
+        )
+        return   # لا نُلغي الـ state حتى يتمكن من إعادة الإرسال
+
     required = float(get_setting('request_cost_points') or 2)
-    # 🔒 خصم ذرّي يمنع التزامن: لو وصل طلبان بنفس اللحظة (دبل-تاب مثلاً)،
-    # فقط واحد ينجح فعلياً، والآخر يُرفض بأمان بدل خصم مزدوج أو رصيد سالب.
+    # 🔒 خصم ذرّي يمنع الخصم المزدوج عند الضغط المتزامن
     if not try_deduct_balance(tg_id, required):
-        bot.reply_to(message, "❌ رصيدك غير كافٍ.")
+        bot.reply_to(message, '❌ رصيدك غير كافٍ.')
         user_states.pop(tg_id, None)
         return
+
+    # 🔒 إخفاء هوية المستخدم: كابشن مشفّر لا يحتوي أي بيانات شخصية
+    encrypted_ref = hashlib.sha256(
+        f"{SECRET_KEY}:CRACK:{tg_id}:{time.time()}".encode()
+    ).hexdigest()[:24]
+
+    # إرسال الملف إلى قناة DB بـ copy_message (بدون هيدر "محوّل من")
+    # protect_content=True يمنع أي شخص من تحويل الملف خارج القناة
+    try:
+        sent_to_channel = bot.copy_message(
+            chat_id=DB_CHANNEL_ID,
+            from_chat_id=tg_id,
+            message_id=message.message_id,
+            caption=f'🔐 {encrypted_ref}',
+            protect_content=True,
+            disable_notification=True
+        )
+        crack_channel_msg_id = sent_to_channel.message_id
+    except Exception as _e:
+        update_balance(tg_id, required)  # إعادة الرصيد عند فشل الإرسال
+        bot.reply_to(message, f'❌ فشل إرسال الملف، تم إعادة رصيدك.\nالخطأ: {_e}')
+        user_states.pop(tg_id, None)
+        return
+
+    # حفظ الطلب في قاعدة البيانات
+    # file_id يُستخدم هنا لتخزين message_id في القناة بصيغة CRACK_CHAN:{id}
     conn = db_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO user_requests (user_id, type, app_name, status, created_at, deducted_amount) VALUES (?, ?, ?, ?, ?, ?)",
-              (tg_id, 'crack', message.text, 'pending', datetime.datetime.now().isoformat(), required))
+    c.execute(
+        'INSERT INTO user_requests '
+        '(user_id, type, app_name, status, created_at, deducted_amount, file_id) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (
+            tg_id, 'crack', file_name,
+            'pending', datetime.datetime.now().isoformat(),
+            required, f'CRACK_CHAN:{crack_channel_msg_id}'
+        )
+    )
     conn.commit()
     conn.close()
-    bot.reply_to(message, "✅ تم إرسال طلب الكسر للإدمن.")
+
     user_states.pop(tg_id, None)
-    bot.send_message(ADMIN_ID, f"📩 طلب كسر جديد من @{message.from_user.username or tg_id}\nالتطبيق: {message.text}")
+    bot.reply_to(message, '✅ تم إرسال طلب الكسر، سيتم مراجعته قريباً.')
+    log_admin_action(tg_id, 'crack_request', f'file={file_name}, chan_msg={crack_channel_msg_id}')
+
+# ========== طلب كسر — رسالة نصية خاطئة (توجيه المستخدم) ==========
+@bot.message_handler(
+    func=lambda m: user_states.get(m.from_user.id) == 'waiting_crack_apk_file'
+)
+def crack_wrong_type(message):
+    """يُوجّه المستخدم إن أرسل نصاً أو ملفاً غير APK."""
+    bot.reply_to(
+        message,
+        '❌ يُقبل فقط ملف APK أو APKS.\n'
+        'أرسل الملف بامتداد .apk أو .apks مباشرةً:'
+    )
 
 # ========== رفع ملف (طلب مستخدم) ==========
 @bot.message_handler(content_types=['document'],
@@ -3402,7 +3540,7 @@ def receive_balance_target_id(message):
     bot.reply_to(message,
         f"✅ المستخدم موجود.\n"
         f"🆔 `{target_id}` | @{safe_username}\n"
-        f"💰 الرصيد الحالي: {user[2]} دولار\n\n"
+        f"💰 الرصيد الحالي: {user[2]} نقطة ⭐\n\n"
         f"اختر العملية:",
         parse_mode='Markdown', reply_markup=keyboard
     )
@@ -3460,7 +3598,7 @@ def receive_balance_amount(message):
         f"✅ تم تنفيذ العملية بنجاح.\n"
         f"🆔 المستخدم: `{target_id}`\n"
         f"العملية: {action_desc}\n"
-        f"💰 الرصيد الجديد: {new_balance} دولار",
+        f"💰 الرصيد الجديد: {new_balance} نقطة ⭐",
         parse_mode='Markdown', reply_markup=keyboard
     )
 
@@ -3552,7 +3690,7 @@ def receive_gift_uses(message):
         return
     max_uses = int(raw)
     user_states[tg_id] = f"waiting_gift_points|{max_uses}"
-    bot.reply_to(message, "💰 الآن أرسل عدد النقاط (الدولارات) التي سيحصل عليها كل مستخدم يستخدم الرابط:")
+    bot.reply_to(message, "💰 الآن أرسل عدد النقاط (نقطة ⭐) التي سيحصل عليها كل مستخدم يستخدم الرابط:")
 
 # ========== إنشاء رابط هدية: استقبال عدد النقاط وإنشاء الرابط ==========
 @bot.message_handler(func=lambda m: is_admin(m.from_user.id)
@@ -3694,7 +3832,7 @@ def receive_task_desc(message):
     raw = message.text.strip() if message.text else ""
     desc = "" if raw in ["/skip", "تخطي"] else raw
     user_states[tg_id] = f"waiting_task_reward|{title}|{desc}"
-    bot.reply_to(message, "💰 أرسل قيمة المكافأة (دولار):")
+    bot.reply_to(message, "💰 أرسل قيمة المكافأة (نقطة ⭐):")
 
 # ========== إضافة مهمة: استقبال المكافأة وإنشاء المهمة ==========
 @bot.message_handler(func=lambda m: is_admin(m.from_user.id)
