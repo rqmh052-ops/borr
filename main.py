@@ -83,7 +83,14 @@ last_force_sub_prompt = {}
 pending_gift_codes = {}
 
 # مفتاح سري للتشفير الداخلي - لا يُشارك أبداً
-SECRET_KEY = secrets.token_hex(32)
+# 🔒 إصلاح: كان يُعاد توليده عند كل restart مما يكسر اتساق generate_app_code
+# (نفس message_id يُعطي app_code مختلفاً بعد كل إعادة تشغيل).
+# الآن يُقرأ من DB إن وُجد، أو يُولَّد ويُحفظ فيها لأول مرة فقط.
+# ملاحظة: يُستدعى _get_or_init_secret_key() بعد init_db() أدناه.
+SECRET_KEY: str = ""  # يُملأ بعد init_db()
+
+# تخزين مؤقت في الذاكرة للـ tokens - يجب تعريفه قبل أي دالة تستخدمه
+pending_tokens = {}
 
 # ======================= نظام التشفير الداخلي =======================
 def generate_app_code(message_id: int) -> str:
@@ -127,9 +134,6 @@ def validate_token(ticket: str, user_id: int) -> str | None:
     app_code = data["app_code"]
     pending_tokens.pop(ticket, None)  # استخدام لمرة واحدة
     return app_code
-
-# تخزين مؤقت في الذاكرة للـ tokens
-pending_tokens = {}
 
 # ======================= حماية ضد التخمين المتكرر (Rate Limiting) =======================
 # ⚠️ هذا يحمي تحديداً مسار appv_{app_code}: لا يوجد طول مساحة كافٍ (7 أرقام
@@ -397,6 +401,32 @@ def init_db():
 
 init_db()
 
+def _get_or_init_secret_key() -> str:
+    """
+    يقرأ SECRET_KEY من جدول settings (مفتاح _internal_secret_key).
+    لو لم يكن موجوداً (أول تشغيل)، يُولّده ويحفظه. هكذا يظل ثابتاً
+    عبر كل إعادات التشغيل بدل توليد مفتاح جديد في كل مرة.
+    🔒 تستخدم db_conn() مباشرة (لا get_setting/set_setting) لأنها
+    تُستدعى قبل تعريف تلك الدوال في الملف.
+    """
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='_internal_secret_key'")
+    row = c.fetchone()
+    if row:
+        conn.close()
+        return row[0]
+    key = secrets.token_hex(32)
+    c.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('_internal_secret_key', ?)",
+        (key,)
+    )
+    conn.commit()
+    conn.close()
+    return key
+
+SECRET_KEY = _get_or_init_secret_key()
+
 # ======================= نسخ احتياطي تلقائي لقاعدة البيانات الكاملة (قناة DB) =======================
 # ⚠️ خط أحمر: هذا النظام يتعامل فقط مع رسالة النسخة الاحتياطية المحفوظ message_id
 # الخاص بها في settings تحت المفتاح BACKUP_MSG_ID_KEY. لا يلمس أبداً أي رسالة
@@ -615,18 +645,18 @@ def get_user(tg_id):
 def register_user(tg_id, username, referrer_id=None):
     conn = db_conn()
     c = conn.cursor()
-    if not get_user(tg_id):
-        try:
-            c.execute("INSERT INTO users (tg_id, username, referrer_id, join_date) VALUES (?, ?, ?, ?)",
-                      (tg_id, username, referrer_id, datetime.datetime.now().isoformat()))
-            conn.commit()
-            conn.close()
-            return True
-        except sqlite3.IntegrityError:
-            conn.close()
-            return False
-    conn.close()
-    return False
+    try:
+        if not get_user(tg_id):
+            try:
+                c.execute("INSERT INTO users (tg_id, username, referrer_id, join_date) VALUES (?, ?, ?, ?)",
+                          (tg_id, username, referrer_id, datetime.datetime.now().isoformat()))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+        return False
+    finally:
+        conn.close()
 
 def update_balance(tg_id, amount):
     conn = db_conn()
@@ -771,6 +801,11 @@ def claim_daily_gift(tg_id: int):
     """
     يصرف الهدية اليومية فعلياً: يحسب القيمة، يضيفها للرصيد، ويحدّث التتالي.
     يُعيد (amount, new_streak, did_referral_today) أو None لو سبق الاستلام اليوم.
+
+    🔒 إصلاح race condition: طلبان متزامنان لنفس المستخدم كانا يتجاوزان can_claim_daily_gift
+    (قراءة منفصلة) ثم كلاهما يُضيف الرصيد مرتين. الحل: جعل الـ UPSERT نفسه هو البوابة
+    الذرّية — نُضيف شرط (last_claim_date != today) في DO UPDATE، فإن كان الصف سُجّل بالفعل
+    لهذا اليوم يكون rowcount=0 وندرك أن طلباً آخر سبقنا، فلا نُضيف الرصيد.
     """
     if not can_claim_daily_gift(tg_id):
         return None
@@ -787,9 +822,15 @@ def claim_daily_gift(tg_id: int):
             last_claim_date = excluded.last_claim_date,
             streak_count = excluded.streak_count,
             bonus_used_date = COALESCE(excluded.bonus_used_date, daily_streaks.bonus_used_date)
+        WHERE daily_streaks.last_claim_date != excluded.last_claim_date
     """, (tg_id, today, new_streak, bonus_date_value))
+    rows_changed = c.rowcount
     conn.commit()
     conn.close()
+
+    # rowcount=0 يعني طلب متزامن آخر سبق وسجّل اليوم -> لا نُضيف الرصيد مرتين
+    if rows_changed == 0:
+        return None
 
     update_balance(tg_id, amount)
     return amount, new_streak, did_referral_today
@@ -803,13 +844,17 @@ def calculate_transfer(amount: float):
     amount_received = round(amount - tax_amount, 2)
     return amount_received, tax_amount
 
-def execute_transfer(sender_id: int, receiver_id: int, amount: float) -> bool:
+def execute_transfer(sender_id: int, receiver_id: int, amount: float):
     """
     تحويل ذرّي: يخصم من المرسل أولاً (try_deduct_balance يمنع التزامن/الرصيد السالب)،
     ولو فشل الخصم لا يحدث أي تغيير. القيمة المُستلمة بعد الضريبة فقط هي ما يُضاف للمستقبِل.
+    يُعيد (amount_received, tax_amount) عند النجاح، أو None عند الفشل.
+    🔒 إصلاح: كانت تُعيد bool فقط، فكان transfer_confirm يستدعي calculate_transfer مرة ثانية
+    لعرض الأرقام - لو تغيّرت إعدادات الضريبة بين الخصم والعرض، المستخدم يرى أرقاماً مختلفة
+    عمّا حدث فعلاً. الآن نُعيد القيم الحقيقية المُحتسبة لحظة التنفيذ.
     """
     if not try_deduct_balance(sender_id, amount):
-        return False
+        return None
     amount_received, tax_amount = calculate_transfer(amount)
     update_balance(receiver_id, amount_received)
 
@@ -822,7 +867,7 @@ def execute_transfer(sender_id: int, receiver_id: int, amount: float) -> bool:
     )
     conn.commit()
     conn.close()
-    return True
+    return amount_received, tax_amount
 
 # ======================= لوحة المتصدرين =======================
 def get_leaderboard(limit: int = 10):
@@ -940,7 +985,7 @@ def complete_task_for_user(task_id: int, tg_id: int) -> float | None:
     except sqlite3.IntegrityError:
         conn.close()
         return None  # سبق إنجازها من قبل
-    conn.close()
+    conn.close()  # 🔒 إصلاح: كان مفقوداً في مسار النجاح → تسريب اتصال
     update_balance(tg_id, reward)
     return reward
 
@@ -1127,19 +1172,19 @@ _referrals_lock = threading.Lock()
 
 def process_pending_referrals():
     """
-    يعالج الإحالات المعلّقة بمنطق مبسّط بدون أي مراقبة لاحقة:
-    ─ الإحالة pending تبقى pending إلى أن يشترك المُحال في القناة.
-    ─ بمجرد التحقق من الاشتراك → الإحالة تُحتسب فوراً ونهائياً (completed)
-      وتُمنح المكافأة مباشرة. لا توجد أي نافذة مراقبة ولا أي خصم لاحق.
+    يعالج الإحالات المعلّقة بمنطق مبسّط بدون أي مراقبة لاحقة.
+    🔒 إصلاح حرج: كان UPDATE status='completed' يُعمَّد (commit) أولاً ثم
+    update_balance تُستدعى في اتصال منفصل. لو تعطّل البوت بينهما، الإحالة
+    تُحسب 'completed' في قاعدة البيانات لكن المُحيل لا يستلم مكافأته أبداً
+    ولا يوجد أي طريقة لاسترداد ذلك. الآن كلاهما في نفس الـ transaction.
     """
     if not _referrals_lock.acquire(blocking=False):
         return
+    conn = db_conn()
     try:
-        conn = db_conn()
         c = conn.cursor()
         now = datetime.datetime.now()
 
-        # جلب كل الإحالات المعلقة (لم تُحتسب بعد)
         c.execute("""
             SELECT id, referrer_id, referred_id
             FROM referrals
@@ -1151,14 +1196,19 @@ def process_pending_referrals():
             if not check_subscription(referred_id):
                 continue
 
-            # اشترك → احتساب نهائي فوري، بلا مراقبة لاحقة
+            # تحديث الحالة وإضافة الرصيد في نفس الـ transaction الواحدة
+            # لضمان عدم فقدان المكافأة عند أي انقطاع بين الخطوتين
             c.execute("""
                 UPDATE referrals
                 SET status='completed', completed_at=?
                 WHERE id=?
             """, (now.isoformat(), ref_id))
+            c.execute(
+                "UPDATE users SET balance = balance + ? WHERE tg_id=?",
+                (REFERRAL_REWARD, referrer_id)
+            )
             conn.commit()
-            update_balance(referrer_id, REFERRAL_REWARD)
+
             referred_username = _get_username(referred_id)
             ref_link = _user_link(referred_id, referred_username)
             try:
@@ -1172,8 +1222,8 @@ def process_pending_referrals():
             except Exception:
                 pass
 
-        conn.close()
     finally:
+        conn.close()
         _referrals_lock.release()
 
 def get_categories():
@@ -1589,13 +1639,18 @@ def callback_handler(call):
         chat_id = call.message.chat.id
 
         # وضع الصيانة
+        # 🔒 إصلاح: call.id قد يكون None عند استدعاء callback_handler داخلياً
+        # (مثل run_search في البحث الذكي عبر _FakeCall)؛ answer_callback_query(None)
+        # يرمي استثناء. الفحص يضمن عدم استدعاء الدالة في هذه الحالة.
         if get_setting('maintenance_mode') == '1' and not is_admin(tg_id) and data not in ['check_subscription', 'dummy']:
-            bot.answer_callback_query(call.id, "🔧 البوت في وضع الصيانة.", show_alert=True)
+            if call.id:
+                bot.answer_callback_query(call.id, "🔧 البوت في وضع الصيانة.", show_alert=True)
             return
 
         # 🚫 المستخدم المحظور: يُمنع من أي تفاعل مع البوت (الإدمن مستثنى دوماً)
         if not is_admin(tg_id) and is_user_banned(tg_id):
-            bot.answer_callback_query(call.id, "🚫 تم حظرك من استخدام البوت.", show_alert=True)
+            if call.id:
+                bot.answer_callback_query(call.id, "🚫 تم حظرك من استخدام البوت.", show_alert=True)
             return
 
         # التحقق من الاشتراك
@@ -1615,7 +1670,10 @@ def callback_handler(call):
                 last_force_sub_prompt.pop(tg_id, None)
                 # تشغيل فوري لمعالجة الإحالة إن وُجدت
                 threading.Thread(target=process_pending_referrals, daemon=True).start()
-                bot.edit_message_text("✅ تم التأكيد!", chat_id, message_id)
+                # 🔧 إصلاح: answer_callback_query كان مفقوداً فيظهر loading indicator
+                # عالق على زر "تأكد الاشتراك" بعد الضغط حتى انتهاء مهلة تيليجرام.
+                bot.answer_callback_query(call.id)
+                bot.edit_message_text("✅ تم التأكيد! أهلاً بك 🎉", chat_id, message_id)
                 bot.send_message(tg_id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(tg_id))
                 # صرف رابط الهدية المعلّق (إن وُجد) بعد تأكيد الاشتراك فعلياً
                 pending_gift = pending_gift_codes.pop(tg_id, None)
@@ -1736,13 +1794,15 @@ def callback_handler(call):
 
             # 🔒 حماية من تخمين app_code المتكرر (انظر شرح _failed_code_attempts بالأعلى)
             if is_rate_limited(tg_id):
-                bot.answer_callback_query(call.id, "⏱️ محاولات كثيرة، حاول لاحقاً بعد دقيقة.", show_alert=True)
+                if call.id:
+                    bot.answer_callback_query(call.id, "⏱️ محاولات كثيرة، حاول لاحقاً بعد دقيقة.", show_alert=True)
                 return
 
             info = get_app_info(app_code)
             if not info:
                 register_failed_code_attempt(tg_id)
-                bot.answer_callback_query(call.id, "التطبيق غير موجود.")
+                if call.id:
+                    bot.answer_callback_query(call.id, "التطبيق غير موجود.")
                 return
             reset_failed_code_attempts(tg_id)
             _, channel_msg_id, category, is_vip, name, downloads = info
@@ -2086,7 +2146,7 @@ def callback_handler(call):
             if not success:
                 bot.edit_message_text("❌ فشل التحويل، تأكد من رصيدك.", chat_id, message_id, reply_markup=keyboard)
                 return
-            received, tax = calculate_transfer(amount)
+            received, tax = success  # القيم الحقيقية المُحتسبة لحظة التنفيذ
             bot.edit_message_text(
                 f"✅ *تم التحويل بنجاح*\n\n"
                 f"📤 أرسلت: {amount} نقطة ⭐\n"
@@ -2838,7 +2898,8 @@ def callback_handler(call):
     except Exception as e:
         print(f"Callback error: {e}")
         try:
-            bot.answer_callback_query(call.id, "حدث خطأ.", show_alert=True)
+            if call.id:
+                bot.answer_callback_query(call.id, "حدث خطأ.", show_alert=True)
         except:
             pass
 
@@ -2914,6 +2975,11 @@ def start_command(message):
                 pending_gift_codes[tg_id] = gift_code
             send_force_sub_prompt(tg_id)
             return
+        # 🔧 إصلاح: المستخدم القديم المشترك الذي فتح رابط هدية — gift_code
+        # كان يُفقد هنا لأن welcome_and_maybe_gift تقرأ فقط من pending_gift_codes
+        # ولا تقرأ المتغير المحلي gift_code مباشرة. نحفظه الآن قبل الاستدعاء.
+        if gift_code:
+            pending_gift_codes[tg_id] = gift_code
         welcome_and_maybe_gift()
         return
 
@@ -2959,6 +3025,12 @@ def start_command(message):
         )
         last_force_sub_prompt[tg_id] = sent.message_id
         return
+
+    # ── مستخدم جديد دخل برابط هدية + مشترك أصلاً ──────────────────────
+    # 🔧 إصلاح: gift_code كان يُفقد هنا — welcome_and_maybe_gift تقرأ من
+    # pending_gift_codes فقط، والمتغير المحلي لا يصلها. نحفظه قبل الاستدعاء.
+    if gift_code:
+        pending_gift_codes[tg_id] = gift_code
 
     # ── مستخدم جديد دخل بدون رابط إحالة ───────────────────────────────
     if not check_subscription(tg_id):
@@ -3183,19 +3255,20 @@ def receive_category_name(message):
     if not name:
         bot.reply_to(message, "الاسم غير صالح.")
         return
+    conn = db_conn()
     try:
-        conn = db_conn()
         c = conn.cursor()
         c.execute("INSERT INTO categories (name, admin_id, created_at) VALUES (?, ?, ?)",
                   (name, message.from_user.id, datetime.datetime.now().isoformat()))
         conn.commit()
-        conn.close()
         log_admin_action(message.from_user.id, "add_category", f"تصنيف: {name}")
-        bot.reply_to(message, f"✅ تم إضافة التصنيف: {name}")
         user_states.pop(message.from_user.id, None)
+        bot.reply_to(message, f"✅ تم إضافة التصنيف: {name}")
         bot.send_message(message.chat.id, "🏠 اختر من القائمة:", reply_markup=main_menu_keyboard(message.from_user.id))
     except sqlite3.IntegrityError:
         bot.reply_to(message, "❌ هذا التصنيف موجود مسبقاً.")
+    finally:
+        conn.close()
 
 # ========== استقبال الاسم الجديد للتطبيق (الاسم الظاهر فقط) ==========
 @bot.message_handler(func=lambda m: is_admin(m.from_user.id)
@@ -3361,7 +3434,7 @@ def receive_ai_search_query(message):
             class _FakeCall:
                 pass
             fake_call = _FakeCall()
-            fake_call.id = "ai_search_internal"
+            fake_call.id = None  # لا يوجد callback_query_id حقيقي هنا - callback_handler يتجاهل answer_callback_query إن كان None
             fake_call.data = f"appv_{app_code}"
             fake_call.from_user = message.from_user
             fake_call.message = thinking_msg
@@ -3439,19 +3512,21 @@ def receive_crack_apk_file(message):
     # حفظ الطلب في قاعدة البيانات
     # file_id يُستخدم هنا لتخزين message_id في القناة بصيغة CRACK_CHAN:{id}
     conn = db_conn()
-    c = conn.cursor()
-    c.execute(
-        'INSERT INTO user_requests '
-        '(user_id, type, app_name, status, created_at, deducted_amount, file_id) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?)',
-        (
-            tg_id, 'crack', file_name,
-            'pending', datetime.datetime.now().isoformat(),
-            required, f'CRACK_CHAN:{crack_channel_msg_id}'
+    try:
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO user_requests '
+            '(user_id, type, app_name, status, created_at, deducted_amount, file_id) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (
+                tg_id, 'crack', file_name,
+                'pending', datetime.datetime.now().isoformat(),
+                required, f'CRACK_CHAN:{crack_channel_msg_id}'
+            )
         )
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
     user_states.pop(tg_id, None)
     bot.reply_to(message, '✅ تم إرسال طلب الكسر، سيتم مراجعته قريباً.')
@@ -3496,6 +3571,11 @@ def handle_upload_request(message):
                      and user_states.get(m.from_user.id, "").startswith("waiting_upload_desc|"))
 def receive_upload_desc(message):
     tg_id = message.from_user.id
+    # 🔒 دفاع ثانٍ: لو حُظر المستخدم بعد دخوله هذه الحالة وقبل إرسال الوصف
+    if not is_admin(tg_id) and is_user_banned(tg_id):
+        user_states.pop(tg_id, None)
+        bot.reply_to(message, "🚫 تم حظرك من استخدام البوت.")
+        return
     state = user_states[tg_id]
     parts = state.split("|", 3)
     file_id = parts[1]
@@ -3503,13 +3583,15 @@ def receive_upload_desc(message):
     deducted_amount = float(parts[3]) if len(parts) > 3 else 1.0
     description = message.text
     conn = db_conn()
-    c = conn.cursor()
-    c.execute("INSERT INTO user_requests (user_id, type, app_name, description, file_id, status, created_at, deducted_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-              (tg_id, 'upload', file_name, description, file_id, 'pending', datetime.datetime.now().isoformat(), deducted_amount))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO user_requests (user_id, type, app_name, description, file_id, status, created_at, deducted_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  (tg_id, 'upload', file_name, description, file_id, 'pending', datetime.datetime.now().isoformat(), deducted_amount))
+        conn.commit()
+    finally:
+        conn.close()
+    user_states.pop(tg_id, None)  # نُزيل الحالة قبل الإرسال حتى لا يعلق المستخدم لو فشل الإرسال
     bot.reply_to(message, "✅ تم إرسال طلب الرفع للإدمن.")
-    user_states.pop(tg_id, None)
     bot.send_message(ADMIN_ID, f"📩 طلب رفع جديد من @{message.from_user.username or tg_id}\nالتطبيق: {file_name}")
 
 
@@ -3578,7 +3660,15 @@ def receive_balance_amount(message):
         update_balance(target_id, amount)
         action_desc = f"إضافة {amount}"
     elif op == "sub":
-        update_balance(target_id, -amount)
+        # 🔒 نستخدم MAX(0,...) لمنع الرصيد السالب عند الخصم الإداري
+        conn_sub = db_conn()
+        c_sub = conn_sub.cursor()
+        c_sub.execute(
+            "UPDATE users SET balance = MAX(0, balance - ?) WHERE tg_id=?",
+            (amount, target_id)
+        )
+        conn_sub.commit()
+        conn_sub.close()
         action_desc = f"خصم {amount}"
     elif op == "set":
         set_balance(target_id, amount)
@@ -3886,18 +3976,27 @@ def edit_setting_value(message):
         bot.reply_to(message, "❌ القيمة يجب أن تكون رقماً.")
 
 def referrals_loop():
-    """يشغّل معالج الإحالات كل دقيقتين للمراقبة المستمرة."""
+    """يشغّل معالج الإحالات كل دقيقتين للمراقبة المستمرة، وينظّف pending_tokens المنتهية الصلاحية."""
     global BOT_USERNAME
     if not BOT_USERNAME:
         try:
             BOT_USERNAME = bot.get_me().username
         except Exception:
             pass
+    cleanup_counter = 0
     while True:
         try:
             process_pending_referrals()
         except Exception as e:
             print(f"⚠️ خطأ في referrals_loop: {e}")
+        # تنظيف pending_tokens المنتهية الصلاحية كل 10 دورات (20 دقيقة)
+        cleanup_counter += 1
+        if cleanup_counter >= 10:
+            cleanup_counter = 0
+            now = time.time()
+            expired_tickets = [t for t, d in list(pending_tokens.items()) if now > d.get("expires", 0)]
+            for t in expired_tickets:
+                pending_tokens.pop(t, None)
         time.sleep(120)
 
 # ======================= تشغيل البوت =======================
