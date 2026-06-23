@@ -2759,7 +2759,7 @@ def callback_handler(call):
                         chat_id=tg_id,
                         from_chat_id=DB_CHANNEL_ID,
                         message_id=crack_msg_id,
-                        protect_content=True,
+                        protect_content=False,  # 🔓 الأدمن يقدر يحول الملف
                         caption=f"🔒 ملف APK | طلب #{req_id} | مستخدم: {user_id_r}"
                     )
                 except Exception as _e:
@@ -2770,10 +2770,10 @@ def callback_handler(call):
                         f"_الملف أُرسل أعلاه (محمي)_")
                 bot.send_message(tg_id, text, parse_mode='Markdown', reply_markup=keyboard)
             else:
-                text = (f"طلب #{req_id}\nالمستخدم: {user_id_r}\n"
+                text = (f"📤 *طلب رفع #{req_id}*\nالمستخدم: {user_id_r}\n"
                         f"النوع: {typ_r}\nالاسم: {app_name_r}\n"
                         f"الوصف: {desc_r or 'لا يوجد'}")
-                bot.edit_message_text(text, chat_id, message_id, reply_markup=keyboard)
+                bot.send_message(tg_id, text, parse_mode='Markdown', reply_markup=keyboard)
 
         elif data.startswith("approve_req_"):
             if not is_admin(tg_id):
@@ -3490,14 +3490,14 @@ def receive_crack_apk_file(message):
     ).hexdigest()[:24]
 
     # إرسال الملف إلى قناة DB بـ copy_message (بدون هيدر "محوّل من")
-    # protect_content=True يمنع أي شخص من تحويل الملف خارج القناة
+    # protect_content=False: الأدمن يقدر يحول من القناة، المستخدم العادي ما يقدر (ليس عضواً بالقناة)
     try:
         sent_to_channel = bot.copy_message(
             chat_id=DB_CHANNEL_ID,
             from_chat_id=tg_id,
             message_id=message.message_id,
             caption=f'🔐 {encrypted_ref}',
-            protect_content=True,
+            protect_content=False,
             disable_notification=True
         )
         crack_channel_msg_id = sent_to_channel.message_id
