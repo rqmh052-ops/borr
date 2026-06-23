@@ -179,6 +179,14 @@ def db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")   # للحماية من الانهيار
     conn.execute("PRAGMA foreign_keys=ON")
+    # 🔒 إصلاح: بدون busy_timeout، أي تصادم كتابة متزامن (مهما كان عابراً
+    # ومللي ثانية واحدة) كان يرمي "database is locked" فوراً بدل الانتظار
+    # قليلاً. هذا خطير خصوصاً لأن كل دالة في البوت تفتح اتصالاً منفصلاً
+    # (لا اتصال واحد مشترك)، فمع نشاط متزامن طبيعي (طلب مستخدم + auto_backup
+    # + referrals_loop كل دقيقتين + بحث ذكي في Thread منفصل) يصبح التصادم
+    # وارداً عملياً وليس نظرياً فقط. الآن تنتظر الاتصالات حتى 5 ثوانٍ قبل
+    # رمي الخطأ، وهو كافٍ جداً لأي عملية SQLite قصيرة عادية في هذا البوت.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 def init_db():
@@ -1577,7 +1585,7 @@ def main_menu_keyboard(tg_id):
         InlineKeyboardButton("📂 التطبيقات", callback_data="show_categories"),
         InlineKeyboardButton("👑 VIP", callback_data="show_vip"),
         InlineKeyboardButton("💰 تجميع الرصيد", callback_data="show_balance"),
-        InlineKeyboardButton("📨 طلب كسر / رفع", callback_data="make_request"),
+        InlineKeyboardButton("📨 طلب كسر", callback_data="make_request"),
     ]
     keyboard.add(*buttons[:2])
     keyboard.add(buttons[2])
@@ -2055,7 +2063,7 @@ def callback_handler(call):
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard
             )
 
-        # ========== طلب كسر / رفع ==========
+        # ========== طلب كسر ==========
         elif data == "make_request":
             required = float(get_setting('request_cost_points') or 2)
             user = get_user(tg_id)
@@ -2066,18 +2074,6 @@ def callback_handler(call):
                 bot.edit_message_text(f"❌ رصيدك غير كافٍ (تحتاج {required} نقطة ⭐).",
                                       chat_id, message_id, reply_markup=keyboard)
                 return
-            keyboard = InlineKeyboardMarkup(row_width=2)
-            keyboard.add(InlineKeyboardButton("🔨 طلب كسر", callback_data="request_crack"))
-            keyboard.add(InlineKeyboardButton("📤 رفع تطبيق", callback_data="request_upload"))
-            keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-            bot.edit_message_text("📨 اختر نوع الطلب:", chat_id, message_id, reply_markup=keyboard)
-
-        elif data == "request_crack":
-            required = float(get_setting('request_cost_points') or 2)
-            user = get_user(tg_id)
-            if not user or user[2] < required:
-                bot.answer_callback_query(call.id, f"❌ رصيدك غير كافٍ (تحتاج {required} نقطة ⭐).", show_alert=True)
-                return
             user_states[tg_id] = "waiting_crack_apk_file"
             keyboard_c = InlineKeyboardMarkup()
             keyboard_c.add(InlineKeyboardButton("❌ إلغاء", callback_data="main_menu"))
@@ -2087,10 +2083,6 @@ def callback_handler(call):
                 "⚠️ ملفات من أي نوع آخر لن تُقبل.",
                 chat_id, message_id, parse_mode='Markdown', reply_markup=keyboard_c
             )
-
-        elif data == "request_upload":
-            user_states[tg_id] = "waiting_upload_file"
-            bot.edit_message_text("📤 أرسل ملف التطبيق:", chat_id, message_id)
 
         # ========== الهدية اليومية ==========
         elif data == "daily_gift":
@@ -3367,8 +3359,14 @@ def receive_ai_search_query(message):
     _ai_username = message.from_user.username or ''
 
     def run_search():
-        app_code = ai_search_app(query)
+        # 🔒 إصلاح خطأ حقيقي: كان استدعاء ai_search_app(query) خارج try/except
+        # أدناه بالكامل. أي استثناء غير متوقع منه (مثل خطأ مؤقت في قاعدة
+        # البيانات، أو أي عطل آخر لا يُتوقع له تحديداً) كان يقتل هذا الـ Thread
+        # بصمت تام (Python يطبع traceback في السجل فقط) دون أن يصل أي رد
+        # للمستخدم على الإطلاق - فيبقى عالقاً للأبد على رسالة "🤖 جاري البحث..."
+        # بدون أي تفسير أو طريقة للمتابعة، ويظن أن البوت تعطّل تماماً.
         try:
+            app_code = ai_search_app(query)
             if not app_code:
                 keyboard = InlineKeyboardMarkup()
                 keyboard.add(InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="main_menu"))
@@ -3543,56 +3541,6 @@ def crack_wrong_type(message):
         '❌ يُقبل فقط ملف APK أو APKS.\n'
         'أرسل الملف بامتداد .apk أو .apks مباشرةً:'
     )
-
-# ========== رفع ملف (طلب مستخدم) ==========
-@bot.message_handler(content_types=['document'],
-                     func=lambda m: user_states.get(m.from_user.id) == "waiting_upload_file")
-def handle_upload_request(message):
-    tg_id = message.from_user.id
-    # 🔒 دفاع ثانٍ: لو حُظر المستخدم بعد دخوله هذه الحالة وقبل إرسال الملف
-    if not is_admin(tg_id) and is_user_banned(tg_id):
-        user_states.pop(tg_id, None)
-        bot.reply_to(message, "🚫 تم حظرك من استخدام البوت.")
-        return
-    required = float(get_setting('request_cost_points') or 2)
-    # 🔒 نفس الحماية الذرّية المستخدمة في طلب الكسر
-    if not try_deduct_balance(tg_id, required):
-        bot.reply_to(message, "❌ رصيدك غير كافٍ.")
-        user_states.pop(tg_id, None)
-        return
-    file_id = message.document.file_id
-    file_name = message.document.file_name or "تطبيق"
-    # 🔧 إصلاح: نُمرّر المبلغ الفعلي المخصوم (required) عبر الـ state، بدل أن
-    # يُفترض لاحقاً قيمة ثابتة غير دقيقة عند إعادته إن رُفض الطلب.
-    user_states[tg_id] = f"waiting_upload_desc|{file_id}|{file_name}|{required}"
-    bot.reply_to(message, "✏️ أرسل وصف التطبيق:")
-
-@bot.message_handler(func=lambda m: isinstance(user_states.get(m.from_user.id, ""), str)
-                     and user_states.get(m.from_user.id, "").startswith("waiting_upload_desc|"))
-def receive_upload_desc(message):
-    tg_id = message.from_user.id
-    # 🔒 دفاع ثانٍ: لو حُظر المستخدم بعد دخوله هذه الحالة وقبل إرسال الوصف
-    if not is_admin(tg_id) and is_user_banned(tg_id):
-        user_states.pop(tg_id, None)
-        bot.reply_to(message, "🚫 تم حظرك من استخدام البوت.")
-        return
-    state = user_states[tg_id]
-    parts = state.split("|", 3)
-    file_id = parts[1]
-    file_name = parts[2]
-    deducted_amount = float(parts[3]) if len(parts) > 3 else 1.0
-    description = message.text
-    conn = db_conn()
-    try:
-        c = conn.cursor()
-        c.execute("INSERT INTO user_requests (user_id, type, app_name, description, file_id, status, created_at, deducted_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  (tg_id, 'upload', file_name, description, file_id, 'pending', datetime.datetime.now().isoformat(), deducted_amount))
-        conn.commit()
-    finally:
-        conn.close()
-    user_states.pop(tg_id, None)  # نُزيل الحالة قبل الإرسال حتى لا يعلق المستخدم لو فشل الإرسال
-    bot.reply_to(message, "✅ تم إرسال طلب الرفع للإدمن.")
-    bot.send_message(ADMIN_ID, f"📩 طلب رفع جديد من @{message.from_user.username or tg_id}\nالتطبيق: {file_name}")
 
 
 # ========== تعديل رصيد مستخدم: استقبال User ID ==========
