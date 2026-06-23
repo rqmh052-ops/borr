@@ -2952,7 +2952,7 @@ def start_command(message):
         name_link = f'<a href="tg://user?id={tg_id}">{safe_display_name}</a>'
         bot.send_message(
             tg_id,
-            f"مرحباً بك {name_link} 🚀",
+            f"مرحباً بك يا {name_link} 🚀",
             parse_mode='HTML',
             reply_markup=main_menu_keyboard(tg_id)
         )
