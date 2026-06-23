@@ -2752,6 +2752,15 @@ def callback_handler(call):
             keyboard.add(InlineKeyboardButton("❌ رفض", callback_data=f"reject_req_{req_id}"))
             keyboard.add(InlineKeyboardButton("🔙 رجوع", callback_data="view_requests"))
             user_id_r, typ_r, app_name_r, desc_r, file_id_r = req
+            # 🔒 إصلاح: app_name_r/desc_r قادمان من المستخدم (اسم ملف حقيقي قد
+            # يحتوي على "_" أو "*" مثل "DeepSeek_مكسور.apk"). إدخالهما داخل
+            # نص Markdown بدون تهريب يكسر التنسيق (عدد فردي من "_") فيرفض
+            # تيليجرام الرسالة كاملةً (can't parse entities). والنتيجة: ملف
+            # الـAPK (من copy_message السابقة) يصل بنجاح لأنه استدعاء منفصل
+            # سبق وتم تنفيذه، لكن رسالة المراجعة التي تحمل أزرار
+            # "✅ موافقة / ❌ رفض" لا تُرسل أبداً ولا يظهر أي خطأ واضح للأدمن.
+            safe_app_name_r = escape_markdown(app_name_r) if app_name_r else app_name_r
+            safe_desc_r = escape_markdown(desc_r) if desc_r else desc_r
             if typ_r == 'crack' and file_id_r and file_id_r.startswith('CRACK_CHAN:'):
                 crack_msg_id = int(file_id_r.split(':')[1])
                 try:
@@ -2766,14 +2775,20 @@ def callback_handler(call):
                     bot.send_message(tg_id, f"⚠️ تعذّر استرداد الملف من القناة: {_e}")
                 text = (f"🔨 *طلب كسر #{req_id}*\n"
                         f"المستخدم: {user_id_r}\n"
-                        f"الملف: {app_name_r}\n"
+                        f"الملف: {safe_app_name_r}\n"
                         f"_الملف أُرسل أعلاه (محمي)_")
-                bot.send_message(tg_id, text, parse_mode='Markdown', reply_markup=keyboard)
             else:
                 text = (f"📤 *طلب رفع #{req_id}*\nالمستخدم: {user_id_r}\n"
-                        f"النوع: {typ_r}\nالاسم: {app_name_r}\n"
-                        f"الوصف: {desc_r or 'لا يوجد'}")
+                        f"النوع: {typ_r}\nالاسم: {safe_app_name_r}\n"
+                        f"الوصف: {safe_desc_r or 'لا يوجد'}")
+            # 🔒 شبكة أمان إضافية: لو فشل تنسيق Markdown لأي سبب آخر غير
+            # متوقع، نرسل نفس الرسالة بنص عادي (بدون parse_mode) حتى لا
+            # تختفي أزرار الموافقة/الرفض بصمت ويبقى الطلب معلقاً للأبد.
+            try:
                 bot.send_message(tg_id, text, parse_mode='Markdown', reply_markup=keyboard)
+            except Exception as _e:
+                print(f"review_req: فشل إرسال رسالة المراجعة بـ Markdown، إرسال كنص عادي: {_e}")
+                bot.send_message(tg_id, text, reply_markup=keyboard)
 
         elif data.startswith("approve_req_"):
             if not is_admin(tg_id):
